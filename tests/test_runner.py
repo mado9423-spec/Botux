@@ -47,7 +47,8 @@ class FakeFeed:
     def __init__(self, clock: FakeClock, candles: list[Candle]) -> None:
         self.clock, self.all = clock, candles
         self.bid, self.ask = D("99.99"), D("100.01")
-        self.error: Exception | None = None
+        self.error: Exception | None = None  # makes the CANDLE endpoint fail
+        self.quote_error: Exception | None = None  # makes the QUOTE endpoint fail
 
     def now_ms(self) -> int:
         return self.clock.now_ms()
@@ -58,6 +59,8 @@ class FakeFeed:
         return [c for c in self.all if c.close_time_ms < self.clock.now_ms()][-count:]
 
     def quote(self, symbol: str) -> Quote:
+        if self.quote_error is not None:
+            raise self.quote_error
         return Quote(symbol, self.bid, self.ask, self.clock.now_ms())
 
     def mark_to_last_close(self) -> None:
@@ -322,7 +325,7 @@ class TestErrorHandling:
             cfg, risk=dataclasses.replace(cfg.risk, max_consecutive_errors=3)
         )
         h = harness(cfg2, rules, store)
-        h.feed.error = DataError("feed down")
+        h.feed.quote_error = DataError("feed down")
         for _ in range(3):
             h.loop.run_cycle()
         assert h.app.kill.is_set() and "Trading halted" in h.notifier.titles()
@@ -337,10 +340,10 @@ class TestErrorHandling:
         )
         h = harness(cfg2, rules, store)
         for _ in range(2):
-            h.feed.error = DataError("blip")
+            h.feed.quote_error = DataError("blip")
             h.loop.run_cycle()
             h.loop.run_cycle()
-            h.feed.error = None
+            h.feed.quote_error = None
             h.loop.run_cycle()
         assert not h.app.kill.is_set()
 
@@ -353,8 +356,13 @@ class TestErrorHandling:
         h.feed.all = h.feed.all[:4]
         h.feed.mark_to_last_close()
         h.loop.run_cycle()
-        assert h.loop.risk.consecutive_errors == 1 and h.orders() == []
-        assert any(e["kind"] == "cycle_error" and "stale" in e["detail"] for e in store.events())
+        # stale candles mean "no signal now": nothing is traded, but it is not an emergency
+        assert h.loop.risk.consecutive_errors == 0 and h.orders() == []
+        assert any(e["kind"] == "no_signal" and "stale" in e["detail"] for e in store.events())
+        for _ in range(3):
+            h.loop.run_cycle()
+        assert "No usable market data" in h.notifier.titles()
+        assert not h.app.kill.is_set()
 
 
 class TestUnconfirmedOrdersInTheLoop:
@@ -434,9 +442,9 @@ class TestProtectionNeverDependsOnTheRestOfTheLoop:
         enter_long(h)
         h.feed.error = DataError("klines unavailable")
         h.feed.bid, h.feed.ask = D("90.00"), D("90.01")
-        h.loop.run_cycle()  # the cycle is reported as failed ...
-        assert h.loop.risk.consecutive_errors == 1
-        assert any(o.intent_key.startswith("stop:") for o in h.orders())  # ... but the stop ran
+        h.loop.run_cycle()  # no signal can be computed, which is not an emergency ...
+        assert h.loop.risk.consecutive_errors == 0
+        assert any(o.intent_key.startswith("stop:") for o in h.orders())  # ... and the stop ran
         assert h.paper.balances()["BTC"].free < rules.min_qty
 
     def test_flatten_on_kill_works_with_an_unresolved_buy(
@@ -491,7 +499,7 @@ class TestProtectionNeverDependsOnTheRestOfTheLoop:
         )
         h = harness(cfg2, rules, store)
         enter_long(h)
-        h.feed.error = DataError("down")
+        h.feed.quote_error = DataError("down")
         h.loop.run_cycle()
         h.loop.run_cycle()
         msg = next(m for _, t, m in h.notifier.items if t == "Trading halted")

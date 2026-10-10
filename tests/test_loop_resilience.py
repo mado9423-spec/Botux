@@ -164,7 +164,7 @@ class TestEmergencyStopTellsTheTruth:
         enter_long(h)
         held = h.paper.balances()["BTC"].free
         h.loop._last_positions.clear()  # as after a restart: nothing remembered from a snapshot
-        h.feed.error = DataError("klines down")
+        h.feed.quote_error = DataError("quotes down")
         for _ in range(h.loop._s.risk.max_consecutive_errors):
             h.loop.run_cycle()
         (halted,) = [m for _, t, m in h.notifier.items if t == "Trading halted"]

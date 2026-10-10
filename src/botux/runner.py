@@ -126,6 +126,8 @@ class TradingLoop:
         self._last_positions: dict[str, Decimal] = {}
         self._last_mid: dict[str, Decimal] = {}
         self._warmed: set[str] = set()
+        self._data_failures: dict[str, int] = {}
+        self._quote_failures: dict[str, int] = {}
         self._baseline: dict[str, Decimal] = {}
         self.stopped = False
         self.cycles = 0
@@ -697,17 +699,18 @@ class TradingLoop:
 
         # One symbol's broken quote must not take the others (or their stop-losses) down.
         quotes: dict[str, Quote] = {}
+        failed: dict[str, Exception] = {}
         for sym in self._s.market.symbols:
             try:
                 quotes[sym] = self._feed.quote(sym)
             except Exception as exc:
                 log.error("%s quote failed: %s: %s", sym, type(exc).__name__, exc)
-                errors.append(exc)
+                failed[sym] = exc
                 continue
             if self._paper is not None:
                 self._paper.set_quote(quotes[sym])
         if not quotes:
-            raise errors[0] if errors else DataError("no quotes at all")
+            raise next(iter(failed.values()), DataError("no quotes at all"))
 
         self._check_open_orders()
         equity, view = self._snapshot(quotes)
@@ -736,7 +739,7 @@ class TradingLoop:
                 acted |= self._protect(sym, quotes[sym], view)
             except Exception as exc:
                 log.error("%s protection step failed: %s: %s", sym, type(exc).__name__, exc)
-                errors.append(exc)
+                errors.append(exc)  # protection failures always count: a position may be exposed
         if acted:
             equity, view = self._snapshot(quotes)
 
@@ -748,7 +751,9 @@ class TradingLoop:
             log.error("could not persist the cycle state: %s: %s", type(exc).__name__, exc)
             errors.append(exc)
 
-        # 2) Signals, which do need validated candles.
+        # 2) Signals, which do need validated candles. A candle problem (a gap, stale or missing
+        #    data) means "no signal for this symbol now": protection above does not need candles,
+        #    so it must not count toward the emergency stop, only be reported.
         for sym in self._s.market.symbols:
             if self._kill.is_set():
                 return
@@ -761,9 +766,41 @@ class TradingLoop:
                 )
                 if self._signals(sym, candles, quotes[sym], view):
                     equity, view = self._snapshot(quotes)  # sizing for the next symbol sees it
+                self._data_failures[sym] = 0
+            except DataError as exc:
+                self._data_failures[sym] = self._data_failures.get(sym, 0) + 1
+                log.error("%s no signal this cycle: %s", sym, exc)
+                self._safe_event("WARNING", "no_signal", {"symbol": sym, "why": str(exc)[:200]})
+                if self._data_failures[sym] >= 3:
+                    self._alert_throttled(
+                        f"data:{sym}",
+                        "WARNING",
+                        "No usable market data",
+                        f"{sym}: no signal for {self._data_failures[sym]} cycles in a row ({exc}). "
+                        "Open positions keep their stop-loss; no new entries or strategy exits "
+                        "until the data is healthy again.",
+                    )
             except Exception as exc:
                 log.error("%s signal step failed: %s: %s", sym, type(exc).__name__, exc)
                 errors.append(exc)
+
+        # A failed quote counts as an error only when it can matter: the symbol is held (its
+        # stop-loss cannot run) or nothing works at all. A bad quote for a symbol we are flat in
+        # is reported but must not stop the bot, nor the stops of the others.
+        for sym, qerr in failed.items():
+            self._quote_failures[sym] = self._quote_failures.get(sym, 0) + 1
+            if self._last_positions.get(sym, ZERO) > 0:
+                errors.append(qerr)
+            elif self._quote_failures[sym] >= 3:
+                self._alert_throttled(
+                    f"quote:{sym}",
+                    "WARNING",
+                    "No usable quote",
+                    f"{sym}: quote failing for {self._quote_failures[sym]} cycles "
+                    f"({type(qerr).__name__}); no trading on it meanwhile.",
+                )
+        for sym in quotes:
+            self._quote_failures[sym] = 0
         if errors:
             raise errors[0]
 
