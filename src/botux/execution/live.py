@@ -91,7 +91,13 @@ def parse_order(payload: Mapping[str, Any]) -> OrderResult:
         exchange_order_id=None if payload.get("orderId") is None else str(payload["orderId"]),
         transact_time_ms=int(payload.get("transactTime") or payload.get("updateTime") or 0),
         fills=fills,
+        expiry_reason=_expiry_reason(payload),
     )
+
+
+def _expiry_reason(payload: Mapping[str, Any]) -> str:
+    reason = str(payload.get("expiryReason") or "")
+    return "" if reason == "NONE" else reason
 
 
 _PARSE_ERRORS = (KeyError, ValueError, TypeError, InvalidOperation)

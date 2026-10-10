@@ -328,6 +328,8 @@ class OrderManager:
         record.executed_qty = result.executed_qty
         record.cumulative_quote_qty = result.cumulative_quote_qty
         record.updated_ms = self._clock.now_ms()
+        if result.expiry_reason:  # e.g. EXECUTION_RULE_PRICE_RANGE_EXCEEDED: keep the venue's why
+            record.note = f"expired: {result.expiry_reason}"
         with self._store.transaction():
             self._store.update_order(record)
             if new_fills:

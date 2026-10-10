@@ -711,3 +711,44 @@ class TestGitignoreCoversCommonSecretNames:
 
 def test_risk_settings_still_accept_defaults() -> None:
     assert RiskSettings().bot_capital is None
+
+
+class TestExpiryReasonIsKept:
+    """Binance reports WHY an order expired (e.g. the execution price range rule); a not-filled
+    exit is much easier to understand with that reason in the order's note."""
+
+    def test_parse_and_record(self, store: Store) -> None:
+        from botux.execution.live import parse_order
+
+        payload = {
+            "symbol": "BTCUSDT", "orderId": 5, "clientOrderId": "bxr", "price": "0",
+            "origQty": "0.001", "executedQty": "0", "cummulativeQuoteQty": "0",
+            "status": "EXPIRED", "type": "MARKET", "side": "SELL", "transactTime": 1,
+            "expiryReason": "EXECUTION_RULE_PRICE_RANGE_EXCEEDED",
+        }  # fmt: skip
+        result = parse_order(payload)
+        assert result.expiry_reason == "EXECUTION_RULE_PRICE_RANGE_EXCEEDED"
+        assert parse_order(payload | {"expiryReason": "NONE"}).expiry_reason == ""
+        assert (
+            parse_order({k: v for k, v in payload.items() if k != "expiryReason"}).expiry_reason
+            == ""
+        )
+
+    def test_the_order_manager_writes_the_reason_into_the_record(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        h.cycle()
+        rec = OrderRecord(
+            "bxr2", "kr2", "BTCUSDT", Side.SELL, OrderType.MARKET, D("0.1"), None,
+            OrderStatus.PENDING_SEND, 1, 1,
+        )  # fmt: skip
+        store.insert_order(rec)
+        answer = OrderResult(
+            "bxr2", "BTCUSDT", Side.SELL, OrderType.MARKET, OrderStatus.EXPIRED, D("0.1"),
+            expiry_reason="EXECUTION_RULE_PRICE_RANGE_EXCEEDED",
+        )  # fmt: skip
+        h.loop.order_manager._apply(rec, answer)
+        saved = store.get_order("bxr2")
+        assert saved is not None and saved.note == "expired: EXECUTION_RULE_PRICE_RANGE_EXCEEDED"
+        assert outcome_of(saved) == "not_filled"

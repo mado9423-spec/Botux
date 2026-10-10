@@ -123,6 +123,7 @@ class OrderResult:
     exchange_order_id: str | None = None
     transact_time_ms: int = 0
     fills: list[Fill] = field(default_factory=list)
+    expiry_reason: str = ""  # Binance `expiryReason` of an expired order (e.g. price range rule)
 
     @property
     def avg_price(self) -> Decimal | None:
