@@ -10,10 +10,10 @@ Python 3.13.16 · uv 0.11.32 · ruff 0.17.0 · mypy 2.4.0 (strict) · pytest 9.1
 
 | الأمر | النتيجة |
 |---|---|
-| `make check` (= `ruff check` + `ruff format --check` + `mypy` + `pytest`) | **exit 0** — `All checks passed!` · `70 files already formatted` · `Success: no issues found in 60 source files` · **575 passed** |
-| `uv run pytest -q --cov=botux --cov-report=term` | 575 passed · التغطية **95%** (4007 سطراً، 211 غير مغطى؛ أدناها `cli.py` 82%) |
+| `make check` (= `ruff check` + `ruff format --check` + `mypy` + `pytest`) | **exit 0** — `All checks passed!` · `73 files already formatted` · `Success: no issues found in 62 source files` · **580 passed** |
+| `uv run pytest -q --cov=botux --cov-report=term` | 580 passed · التغطية **95%** (4017 سطراً، 208 غير مغطى؛ أدناها `cli.py` 82%) |
 | `uv export --no-hashes --no-emit-project > req.txt && uvx pip-audit -r req.txt --no-deps --disable-pip` | `No known vulnerabilities found` (20 اعتمادية مثبّتة) |
-| فحص أسرار على الملفات المتتبَّعة (76 ملفاً؛ يُستثنى `uv.lock` لأنه تجزئات) | لا أسرار؛ ثلاث مطابقات «سلسلة طويلة» هي **أسماء أصناف** في الاختبارات (لا قيم). لا `.env` متتبَّع غير `.env.example` (قيم وهمية). لا اسم ملف أسرار في التاريخ سوى `secrets_guard.py` و`test_secrets.py` |
+| فحص أسرار على الملفات المتتبَّعة (79 ملفاً؛ يُستثنى `uv.lock` لأنه تجزئات) | لا أسرار؛ أربع مطابقات «سلسلة طويلة» هي **أسماء أصناف** في الاختبارات (لا قيم). لا `.env` متتبَّع غير `.env.example` (قيم وهمية). لا اسم ملف أسرار في التاريخ سوى `secrets_guard.py` و`test_secrets.py` |
 | فحص المضيفات في `src/` | `api.binance.com`، `data-api.binance.vision`، `github.com` (توثيق) فقط؛ لا مضيف غير موثّق |
 | إعدادات Claude Code/MCP/مهارات داخل المشروع | لا `.claude/` ولا `CLAUDE.md` ولا `.mcp.json`؛ **لم أُثبّت أي مهارة أو إضافة أو مستودع خارجي** |
 
