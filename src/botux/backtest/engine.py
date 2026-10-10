@@ -53,7 +53,8 @@ class BacktestResult:
     candles_in_position: int = 0
     candles_total: int = 0
     fees_paid: Decimal = ZERO
-    buy_and_hold_return: float = 0.0
+    buy_and_hold_return: float = 0.0  # 100% of the initial cash invested for the whole period
+    buy_and_hold_same_capital: float = 0.0  # same capital cap as the strategy, on total equity
     interval_ms: int = 0
 
 
@@ -163,4 +164,8 @@ def run_backtest(
     res.final_equity = cash + base * candles[-1].close if candles else initial_cash
     if candles:
         res.buy_and_hold_return = float(candles[-1].close / candles[0].open - 1)
+        # The strategy never deploys more than the per-order/position caps, so comparing it with a
+        # 100%-invested baseline would flatter the baseline: scale the baseline to the same capital.
+        deployed = min(risk.max_order_notional, risk.max_position_notional, initial_cash)
+        res.buy_and_hold_same_capital = res.buy_and_hold_return * float(deployed / initial_cash)
     return res

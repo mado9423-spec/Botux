@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from decimal import Decimal
 from typing import Protocol
 
@@ -18,10 +18,11 @@ from botux.clock import Clock
 from botux.config import SUPPORTED_INTERVALS, Settings
 from botux.data.market import fetch_latest_closed, fetch_quote, validate_live_candles
 from botux.decimals import ZERO
+from botux.errors import LiveTradingNotAllowed
 from botux.exchange.client import BinanceSpotClient
 from botux.exchange.rules import SymbolRules
 from botux.execution.broker import Broker
-from botux.execution.order_manager import OrderIntent, OrderManager
+from botux.execution.order_manager import OrderIntent, OrderManager, SubmitResult
 from botux.execution.paper import PaperBroker
 from botux.execution.positions import PositionBook
 from botux.killswitch import KillSwitch
@@ -62,6 +63,9 @@ class BinanceMarketFeed:
 
 
 class TradingLoop:
+    ALERT_REPEAT_SECONDS = 600.0
+    MAX_RETRIES_PER_CANDLE = 3
+
     def __init__(
         self,
         *,
@@ -79,6 +83,7 @@ class TradingLoop:
         rules: Mapping[str, SymbolRules],
         paper_broker: PaperBroker | None = None,
         act_on_current_candle: bool = False,
+        gate_check: Callable[[], None] | None = None,
     ) -> None:
         self._s = settings
         self._feed = feed
@@ -94,15 +99,20 @@ class TradingLoop:
         self._rules = dict(rules)
         self._paper = paper_broker
         self._act_current = act_on_current_candle
+        self._gate_check = gate_check
         self._stop_requested = False
         self._kill_handled = False
+        self._gate_closed = False
         self._halt_alerted_day: int | None = None
+        self._alerted_at: dict[str, float] = {}
+        self._retries: dict[tuple[str, int], int] = {}
+        self._last_positions: dict[str, Decimal] = {}
+        self._baseline: dict[str, Decimal] = {}
         self.stopped = False
         self.cycles = 0
         raw = store.kv_get("risk_state")
         if raw:
             risk.restore_state(json.loads(raw))
-        self._baseline: dict[str, Decimal] = {}
 
     @property
     def order_manager(self) -> OrderManager:
@@ -121,11 +131,19 @@ class TradingLoop:
     def on_fill(self, record: OrderRecord, fills: list[Fill]) -> None:
         """Wired into the OrderManager: keeps entry price / stop level in sync."""
         if record.side is Side.BUY:
-            first = fills[0]
-            self._positions.on_buy(
-                record.symbol, ZERO, sum((f.quantity for f in fills), ZERO), first.price
-            )
-        else:
+            if record.executed_qty > 0:
+                # volume-weighted entry across ALL fills of the order (not just the first one)
+                price = record.cumulative_quote_qty / record.executed_qty
+                self._positions.on_buy(record.symbol, ZERO, record.executed_qty, price)
+            return
+        # SELL: forget the entry only once (almost) nothing is left to protect
+        try:
+            held = self._position_qty(record.symbol, self._broker.balances())
+        except Exception:
+            log.exception("could not read balances after a sell; keeping the stop in place")
+            return
+        rules = self._rules[record.symbol]
+        if rules.round_qty(held, OrderType.MARKET) < max(rules.min_qty, rules.step_size):
             self._positions.clear(record.symbol)
 
     # ------------------------------------------------------------------ control
@@ -166,6 +184,18 @@ class TradingLoop:
         log.info("trading loop stopped: %s", why)
         self.stopped = True
 
+    def _alert_throttled(self, key: str, level: str, title: str, message: str) -> None:
+        """Alert at most once per ALERT_REPEAT_SECONDS for the same key (avoid spamming)."""
+        now = self._clock.monotonic()
+        last = self._alerted_at.get(key)
+        if last is None or now - last >= self.ALERT_REPEAT_SECONDS:
+            self._alerted_at[key] = now
+            self._notifier.notify(level, title, message)
+
+    def _open_positions_text(self) -> str:
+        held = {s: q for s, q in self._last_positions.items() if q > 0}
+        return ", ".join(f"{s}={q}" for s, q in held.items()) or "none"
+
     # ------------------------------------------------------------------ one cycle
 
     def run_cycle(self) -> None:
@@ -174,6 +204,7 @@ class TradingLoop:
             return
         self.cycles += 1
         try:
+            self._check_gate()
             self._cycle()
             self._risk.record_success()
         except Exception as exc:
@@ -190,27 +221,67 @@ class TradingLoop:
                     f"last: {type(exc).__name__}"
                 )
                 self._kill.trip(reason)
-                self._notifier.notify("CRITICAL", "Trading halted", reason)
+                held = self._open_positions_text()
+                suffix = ""
+                if held != "none" and not self._s.risk.flatten_on_kill:
+                    suffix = f" OPEN POSITIONS LEFT WITHOUT STOP PROTECTION: {held}."
+                self._notifier.notify("CRITICAL", "Trading halted", reason + suffix)
+
+    def _check_gate(self) -> None:
+        """Re-verify the live gate every cycle (arming expiry, disarm, settings drift, key rights).
+
+        A closed gate halts NEW entries for good (until restart); exits stay possible so that
+        existing positions can still be protected.
+        """
+        if self._gate_check is None or self._gate_closed:
+            return
+        try:
+            self._gate_check()
+        except LiveTradingNotAllowed as exc:
+            self._gate_closed = True
+            self._risk.halt(f"live gate closed: {exc}")
+            self._notifier.notify(
+                "CRITICAL",
+                "Live gate closed",
+                f"{exc}. New entries are halted; exits still work. Run 'botux kill' to stop "
+                "completely, or re-arm and restart.",
+            )
 
     def _on_kill(self) -> None:
         """Emergency stop: cancel open orders, optionally flatten, then stop for good."""
         if self._kill_handled:
             return
         self._kill_handled = True
-        reason = self._kill.reason()
-        self._notifier.notify("CRITICAL", "EMERGENCY STOP", reason)
-        self._store.log_event(self._clock.now_ms(), "CRITICAL", "kill_switch", {"reason": reason})
         try:
-            self._om.cancel_all_open()
-        except Exception:
-            log.exception("could not cancel open orders during emergency stop")
-        if self._s.risk.flatten_on_kill:
-            for sym in self._s.market.symbols:
-                try:
-                    self._flatten(sym, "flatten_on_kill")
-                except Exception:
-                    log.exception("flatten failed for %s", sym)
-        self.stopped = True
+            try:
+                reason = self._kill.reason()
+            except Exception:
+                reason = "kill switch set"
+            self._notifier.notify("CRITICAL", "EMERGENCY STOP", reason)
+            self._store.log_event(
+                self._clock.now_ms(), "CRITICAL", "kill_switch", {"reason": reason}
+            )
+            try:
+                self._om.cancel_all_open()
+            except Exception:
+                log.exception("could not cancel open orders during emergency stop")
+            if self._s.risk.flatten_on_kill:
+                for sym in self._s.market.symbols:
+                    try:
+                        self._flatten(sym, "flatten_on_kill")
+                    except Exception:
+                        log.exception("flatten failed for %s", sym)
+            else:
+                held = self._open_positions_text()
+                if held != "none":
+                    self._notifier.notify(
+                        "CRITICAL",
+                        "Open position left unprotected",
+                        f"Emergency stop with open positions ({held}) and flatten_on_kill=false: "
+                        "nothing manages the stop-loss any more. Close them manually if needed.",
+                    )
+        finally:
+            self.stopped = True
 
     def _flatten(self, symbol: str, why: str) -> None:
         rules = self._rules[symbol]
@@ -218,7 +289,7 @@ class TradingLoop:
         if qty <= 0:
             return
         quote = self._feed.quote(symbol)
-        self._om.submit(
+        result = self._om.submit(
             OrderIntent(
                 intent_key=f"flatten:{symbol}:{self._clock.now_ms() // 60_000}:{why}",
                 symbol=symbol,
@@ -229,6 +300,12 @@ class TradingLoop:
                 is_exit=True,
             )
         )
+        if result.outcome != "accepted":
+            self._notifier.notify(
+                "CRITICAL",
+                "Flatten failed",
+                f"{symbol}: {result.outcome} {result.reason}. Close the position manually.",
+            )
 
     # ------------------------------------------------------------------ helpers
 
@@ -236,11 +313,16 @@ class TradingLoop:
         return self._feed.now_ms()
 
     def _position_qty(self, symbol: str, balances: Mapping[str, Balance]) -> Decimal:
-        """Free base balance above the baseline recorded at first start (never touches pre-existing
-        holdings of the same asset)."""
+        """Sellable amount that belongs to the bot.
+
+        The baseline (free + locked amount of the base asset at first start) is never touched, so
+        coins the user already owned, including coins locked in the user's own orders, are not
+        the bot's to sell. Only FREE coins can be sold.
+        """
         base = self._rules[symbol].base_asset
         bal = balances.get(base)
-        total = bal.free if bal is not None else ZERO
+        free = bal.free if bal is not None else ZERO
+        total = bal.total if bal is not None else ZERO
         if base not in self._baseline:
             stored = self._store.kv_get(f"baseline:{base}")
             if stored is None:
@@ -248,7 +330,7 @@ class TradingLoop:
                 self._baseline[base] = total
             else:
                 self._baseline[base] = Decimal(stored)
-        return max(ZERO, total - self._baseline[base])
+        return max(ZERO, min(free, total - self._baseline[base]))
 
     def _snapshot(self, quotes: Mapping[str, Quote]) -> tuple[Decimal, PortfolioView]:
         balances = self._broker.balances()
@@ -265,6 +347,7 @@ class TradingLoop:
             owned_total = max(ZERO, (bal.total if bal else ZERO) - self._baseline[base])
             notional[sym] = owned_total * quotes[sym].mid
             equity += notional[sym]
+        self._last_positions = dict(qty)
         day_start = (self._now() // DAY_MS) * DAY_MS
         open_orders = len(self._om.open_orders()) + len(self._om.uncertain_orders())
         view = PortfolioView(
@@ -283,14 +366,8 @@ class TradingLoop:
         now = self._now()
         self._om.reconcile_pending()
 
-        candles: dict[str, list[Candle]] = {}
         quotes: dict[str, Quote] = {}
         for sym in self._s.market.symbols:
-            cs = self._feed.closed_candles(sym, self._strategy.warmup + 2)
-            validate_live_candles(
-                cs, self._s.market.interval, now, self._s.market.max_candle_age_factor
-            )
-            candles[sym] = cs
             quotes[sym] = self._feed.quote(sym)
             if self._paper is not None:
                 self._paper.set_quote(quotes[sym])
@@ -309,65 +386,118 @@ class TradingLoop:
                 "no new entries until the next UTC day.",
             )
 
-        for sym in self._s.market.symbols:
-            self._manage_symbol(sym, candles[sym], quotes[sym], view)
+        errors: list[Exception] = []
 
-    def _manage_symbol(
-        self, sym: str, candles: list[Candle], quote: Quote, view: PortfolioView
-    ) -> None:
-        reason = self._om.is_symbol_blocked(sym)
-        if reason:
-            log.warning("%s skipped: %s", sym, reason)
-            return
+        # 1) Protection first. It needs only quotes and balances, never candle data, so a broken
+        #    kline feed cannot disable the stop-loss. One failing symbol must not starve others.
+        acted = False
+        for sym in self._s.market.symbols:
+            try:
+                acted |= self._protect(sym, quotes[sym], view)
+            except Exception as exc:
+                log.error("%s protection step failed: %s: %s", sym, type(exc).__name__, exc)
+                errors.append(exc)
+        if acted:
+            equity, view = self._snapshot(quotes)
+
+        # 2) Signals, which do need validated candles.
+        for sym in self._s.market.symbols:
+            try:
+                candles = self._feed.closed_candles(sym, self._strategy.warmup + 2)
+                validate_live_candles(
+                    candles, self._s.market.interval, now, self._s.market.max_candle_age_factor
+                )
+                if self._signals(sym, candles, quotes[sym], view):
+                    equity, view = self._snapshot(quotes)  # sizing for the next symbol sees it
+            except Exception as exc:
+                log.error("%s signal step failed: %s: %s", sym, type(exc).__name__, exc)
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def _in_position(self, sym: str, view: PortfolioView) -> tuple[Decimal, bool]:
         rules = self._rules[sym]
         held = rules.round_qty(view.position_qty.get(sym, ZERO), OrderType.MARKET)
-        in_position = held > 0 and held >= rules.min_qty
-        now = self._now()
+        return held, held > 0 and held >= rules.min_qty
 
-        # Software stop-loss: only effective while the bot is running and connected.
+    def _protect(self, sym: str, quote: Quote, view: PortfolioView) -> bool:
+        """Software stop-loss: only effective while the bot runs and is connected."""
+        held, in_position = self._in_position(sym, view)
+        if not in_position:
+            return False
         info = self._positions.get(sym)
-        if in_position and info is None:
-            log.warning(
-                "%s: holding a position without a recorded entry; stop-loss is INACTIVE", sym
+        if info is None:
+            # e.g. after a crash between the fill and its bookkeeping: protect from NOW on.
+            self._positions.on_buy(sym, ZERO, held, quote.mid)
+            info = self._positions.get(sym)
+            self._notifier.notify(
+                "WARNING",
+                "Stop-loss re-armed",
+                f"{sym}: position {held} had no recorded entry; stop re-armed from the current "
+                f"price {quote.mid}.",
             )
-        if in_position and info is not None and quote.bid <= info.stop_price:
+        if info is not None and quote.bid <= info.stop_price:
             log.warning("%s stop-loss: bid %s <= stop %s", sym, quote.bid, info.stop_price)
-            self._submit_exit(sym, held, quote, f"stop:{sym}:{now // 60_000}", view)
-            return
+            result = self._submit_exit(
+                sym, held, quote, f"stop:{sym}:{self._now() // 60_000}", view, "stop-loss"
+            )
+            return result is not None
+        return False
 
+    def _signals(self, sym: str, candles: list[Candle], quote: Quote, view: PortfolioView) -> bool:
+        """Act on a newly closed candle. Returns True when an order was attempted."""
+        rules = self._rules[sym]
+        held, in_position = self._in_position(sym, view)
         last = candles[-1]
         key = f"lastc:{sym}"
         seen = self._store.kv_get(key)
         if seen is None and not self._act_current:
             self._store.kv_set(key, str(last.open_time_ms))
             log.info("%s: warm start, waiting for the next candle before trading", sym)
-            return
-        if seen == str(last.open_time_ms):
-            return
+            return False
+        previous = int(seen) if seen not in (None, "") else None
+        if previous is not None and last.open_time_ms <= previous:
+            return False  # same candle again, or a stale answer from the API: never go backwards
         self._store.kv_set(key, str(last.open_time_ms))  # at most one decision per candle
 
         signal = self._strategy.on_candles(candles, in_position)
         log.info("%s signal=%s in_position=%s equity=%.2f", sym, signal, in_position, view.equity)
+        result: SubmitResult | None = None
         if signal is Signal.ENTER_LONG and not in_position:
-            self._submit_entry(sym, rules, quote, view, last)
+            blocked = self._om.is_symbol_blocked(sym)
+            if blocked:
+                log.warning("%s entry skipped: %s", sym, blocked)
+                return False
+            result = self._submit_entry(sym, rules, quote, view, last)
         elif signal is Signal.EXIT_LONG and in_position:
-            self._submit_exit(
-                sym, held, quote, f"{self._strategy.name}:{sym}:{last.open_time_ms}:SELL", view
+            result = self._submit_exit(
+                sym,
+                held,
+                quote,
+                f"{self._strategy.name}:{sym}:{last.open_time_ms}:SELL",
+                view,
+                "strategy exit",
             )
+        if result is not None and result.outcome == "retry_later":
+            n = self._retries.get((sym, last.open_time_ms), 0) + 1
+            self._retries[(sym, last.open_time_ms)] = n
+            if n < self.MAX_RETRIES_PER_CANDLE:  # provably not sent: look at this candle again
+                self._store.kv_set(key, "" if previous is None else str(previous))
+        return result is not None
 
     def _submit_entry(
         self, sym: str, rules: SymbolRules, quote: Quote, view: PortfolioView, last: Candle
-    ) -> None:
+    ) -> SubmitResult | None:
         sizing = self._risk.size_entry(rules, quote.ask, view, OrderType.MARKET)
         if sizing.quantity <= 0:
             log.info("%s entry skipped by risk sizing: %s", sym, "; ".join(sizing.reasons))
-            return
+            return None
         decision = self._risk.check_order(
             rules, Side.BUY, OrderType.MARKET, sizing.quantity, None, quote.ask, view
         )
         if not decision.allowed:
             log.info("%s entry rejected by risk: %s", sym, "; ".join(decision.reasons))
-            return
+            return None
         result = self._om.submit(
             OrderIntent(
                 intent_key=f"{self._strategy.name}:{sym}:{last.open_time_ms}:BUY",
@@ -379,17 +509,30 @@ class TradingLoop:
             )
         )
         log.info("%s BUY %s -> %s %s", sym, sizing.quantity, result.outcome, result.reason)
+        return result
 
     def _submit_exit(
-        self, sym: str, held: Decimal, quote: Quote, intent_key: str, view: PortfolioView
-    ) -> None:
+        self,
+        sym: str,
+        held: Decimal,
+        quote: Quote,
+        intent_key: str,
+        view: PortfolioView,
+        why: str,
+    ) -> SubmitResult | None:
         rules = self._rules[sym]
         decision = self._risk.check_order(
             rules, Side.SELL, OrderType.MARKET, held, None, quote.bid, view
         )
         if not decision.allowed:
-            log.warning("%s exit rejected by risk: %s", sym, "; ".join(decision.reasons))
-            return
+            self._alert_throttled(
+                f"exit-risk:{sym}",
+                "CRITICAL",
+                "Exit refused by local checks",
+                f"{sym}: cannot {why} {held}: {'; '.join(decision.reasons)}. The position is "
+                "still open.",
+            )
+            return None
         result = self._om.submit(
             OrderIntent(
                 intent_key=intent_key,
@@ -401,7 +544,16 @@ class TradingLoop:
                 is_exit=True,
             )
         )
-        log.info("%s SELL %s -> %s %s", sym, held, result.outcome, result.reason)
+        log.info("%s SELL %s (%s) -> %s %s", sym, held, why, result.outcome, result.reason)
+        if result.outcome not in ("accepted", "duplicate"):
+            self._alert_throttled(
+                f"exit-fail:{sym}",
+                "CRITICAL",
+                "Exit order did not go through",
+                f"{sym}: {why} of {held} -> {result.outcome}: {result.reason}. The position may "
+                "still be open.",
+            )
+        return result
 
 
 def interval_ms_of(settings: Settings) -> int:

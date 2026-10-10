@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from hypothesis import given
@@ -67,6 +68,30 @@ class TestParsing:
         filters.append({"filterType": "MIN_NOTIONAL", "minNotional": "10", "applyToMarket": False})
         r = SymbolRules.from_exchange_info(exchange_info, "BTCUSDT")
         assert r.min_notional == DEC("10") and r.apply_min_to_market is False
+
+
+class TestBothNotionalFilters:
+    def test_min_notional_and_notional_are_evaluated_independently(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        filters = exchange_info["symbols"][0]["filters"]
+        # NOTIONAL (from the fixture): min 5, applies to market. Add a legacy MIN_NOTIONAL of 10
+        # that does NOT apply to market orders, and make NOTIONAL not apply to market either.
+        for f in filters:
+            if f["filterType"] == "NOTIONAL":
+                f["applyMinToMarket"] = False
+        filters.append({"filterType": "MIN_NOTIONAL", "minNotional": "10", "applyToMarket": True})
+        r = SymbolRules.from_exchange_info(exchange_info, "BTCUSDT")
+        assert r.min_notional == DEC("10") and r.extra_min_notionals == ((DEC("5"), False),)
+        qty = DEC("0.00009")  # 5.4 USDT at 60000: above 5, below 10
+        assert any(
+            "NOTIONAL" in p
+            for p in r.violations(Side.BUY, OrderType.MARKET, qty, None, DEC("60000"))
+        )
+        # as a LIMIT order both minimums apply, and the larger one binds
+        assert r.violations(Side.BUY, OrderType.LIMIT, qty, DEC("60000.00"), DEC("60000"))
+        ok = DEC("0.00020")  # 12 USDT
+        assert r.violations(Side.BUY, OrderType.MARKET, ok, None, DEC("60000")) == []
 
 
 class TestRounding:

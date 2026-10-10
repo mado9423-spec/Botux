@@ -8,6 +8,7 @@ instead of blindly creating a second one. All SQL uses bound parameters.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -16,7 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from botux.decimals import ZERO, D
+from botux.errors import ConfigError
 from botux.models import Fill, OrderStatus, OrderType, Side
+from botux.secrets_guard import GLOBAL_REDACTOR
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -78,6 +81,41 @@ class OrderRecord:
     note: str = ""
 
 
+class InstanceLock:
+    """Advisory single-instance lock (``flock`` on ``<database>.lock``).
+
+    Two bots on the same database would race on deterministic client order ids. In-memory
+    databases and platforms without ``fcntl`` get a no-op lock.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self._path = None if str(db_path) == ":memory:" else Path(f"{db_path}.lock")
+        self._fd: int | None = None
+
+    def acquire(self) -> None:
+        if self._path is None:
+            return
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX platforms
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise ConfigError(
+                f"another Botux instance is already using {self._path.with_suffix('')}"
+            ) from None
+        self._fd = fd
+
+    def release(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)  # closing the descriptor drops the flock
+            self._fd = None
+
+
 class Store:
     def __init__(self, path: str | Path = ":memory:") -> None:
         self._path = str(path)
@@ -93,6 +131,20 @@ class Store:
 
     def close(self) -> None:
         self._conn.close()
+
+    def claim_mode(self, mode: str) -> None:
+        """Bind this database to one trading mode; refuse to be opened by the other one.
+
+        Paper sessions reset position/halt state, which would wipe the safety state of a live
+        session if both used the same file.
+        """
+        existing = self.kv_get("db_mode")
+        if existing and existing != mode:
+            raise ConfigError(
+                f"this database belongs to '{existing}' mode and must not be opened in '{mode}' "
+                "mode; give each mode its own database file"
+            )
+        self.kv_set("db_mode", mode)
 
     # ------------------------------------------------------------------ orders
 
@@ -120,12 +172,21 @@ class Store:
                         rec.created_ms,
                         rec.updated_ms,
                         rec.reconcile_attempts,
-                        rec.note,
+                        GLOBAL_REDACTOR.scrub(rec.note),
                     ),
                 )
         except sqlite3.IntegrityError:
             return False
         return True
+
+    def delete_unsent_order(self, client_order_id: str) -> bool:
+        """Delete a PENDING_SEND row that provably never reached the venue (only those)."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM orders WHERE client_order_id=? AND status=?",
+                (client_order_id, OrderStatus.PENDING_SEND.value),
+            )
+        return cur.rowcount == 1
 
     def update_order(self, rec: OrderRecord) -> None:
         with self._conn:
@@ -140,7 +201,7 @@ class Store:
                     str(rec.cumulative_quote_qty),
                     rec.updated_ms,
                     rec.reconcile_attempts,
-                    rec.note,
+                    GLOBAL_REDACTOR.scrub(rec.note),
                     rec.client_order_id,
                 ),
             )
@@ -236,9 +297,8 @@ class Store:
     # ------------------------------------------------------------------ events / kv / equity
 
     def log_event(self, ts_ms: int, level: str, kind: str, detail: dict[str, Any] | str) -> None:
-        text = (
-            detail if isinstance(detail, str) else json.dumps(detail, default=str, sort_keys=True)
-        )
+        raw = detail if isinstance(detail, str) else json.dumps(detail, default=str, sort_keys=True)
+        text = GLOBAL_REDACTOR.scrub(raw)
         with self._conn:
             self._conn.execute(
                 "INSERT INTO events (ts_ms, level, kind, detail) VALUES (?,?,?,?)",

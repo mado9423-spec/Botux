@@ -121,12 +121,14 @@ class TestDuplicates:
 
 
 class TestOutagesAndRejections:
-    def test_network_down_before_sending_is_a_clean_rejection(self, env: Env) -> None:
+    def test_network_down_before_sending_leaves_no_trace_and_can_be_retried(self, env: Env) -> None:
         env.broker.faults.push(FaultKind.NETWORK_DOWN)
         r = env.om.submit(buy())
-        assert r.outcome == "rejected" and r.record is not None
-        assert r.record.status is OrderStatus.REJECTED and "not sent" in r.record.note
-        assert env.om.is_symbol_blocked("BTCUSDT") is None  # nothing uncertain, trading may go on
+        assert r.outcome == "retry_later" and "not sent" in r.reason
+        assert env.store.list_orders() == []  # provably never left: the intent key is free again
+        assert env.om.is_symbol_blocked("BTCUSDT") is None
+        assert env.om.submit(buy()).outcome == "accepted"  # same intent, now it goes through
+        assert env.broker.placed_count == 1
 
     def test_exchange_side_rejection(self, env: Env) -> None:
         env.broker.faults.push(FaultKind.REJECT)
@@ -140,16 +142,24 @@ class TestOutagesAndRejections:
         assert r.outcome == "blocked" and "LOT_SIZE" in r.reason
         assert env.store.list_orders() == [] and env.broker.placed_count == 0
 
-    def test_unexpected_exchange_errors_count_as_rejections_not_unknowns(self, env: Env) -> None:
-        from botux.errors import RateLimitError
+    def test_refusals_before_the_engine_are_retryable_not_unknown(self, env: Env) -> None:
+        from botux.errors import APIError, ClockSkewError, RateLimitError
 
-        class Limited:
+        class Refusing:
+            def __init__(self, exc: Exception) -> None:
+                self.exc = exc
+
             def place_order(self, req: OrderRequest) -> OrderResult:
-                raise RateLimitError("429", retry_after=5)
+                raise self.exc
 
-        om = env.manager(Limited())
-        r = om.submit(buy())
-        assert r.outcome == "rejected"
+        for exc in (RateLimitError("429", retry_after=5), ClockSkewError("skew", code=-1021)):
+            r = env.manager(Refusing(exc)).submit(buy())
+            assert r.outcome == "retry_later" and env.store.list_orders() == []
+        # while any other API error is a final refusal that consumes the intent
+        r = env.manager(Refusing(APIError("nope", code=-2010, http_status=400))).submit(buy())
+        assert r.outcome == "rejected" and r.record is not None
+        assert r.record.status is OrderStatus.REJECTED
+        assert env.om.submit(buy()).outcome == "duplicate"
 
 
 class TestUnconfirmedOrders:
@@ -300,3 +310,23 @@ class TestFillBookkeeping:
         ]
         assert sum((f.quantity for f in fills), D(0)) == D("1")
         assert len(env.fills) == 2
+
+
+class TestExitsAreNotBlockedByUnresolvedBuys:
+    def test_a_stop_loss_sell_goes_out_while_a_buy_is_unresolved(self, env: Env) -> None:
+        env.om.submit(buy("e0"))  # we hold some BTC
+        env.broker.faults.push(FaultKind.TIMEOUT_NOT_EXECUTED)
+        assert (
+            env.om.submit(buy("e1")).outcome == "uncertain"
+        )  # an unresolved BUY now blocks entries
+        assert env.om.submit(buy("e2")).outcome == "blocked"
+        qty = env.rules.round_qty(env.broker.balances()["BTC"].free)
+        assert env.om.submit(sell("x1", str(qty))).outcome == "accepted"
+
+    def test_but_a_second_sell_waits_for_an_unresolved_sell(self, env: Env) -> None:
+        env.om.submit(buy("e0"))
+        qty = env.rules.round_qty(env.broker.balances()["BTC"].free)
+        env.broker.faults.push(FaultKind.TIMEOUT_NOT_EXECUTED)
+        assert env.om.submit(sell("x1", str(qty))).outcome == "uncertain"
+        assert env.om.submit(sell("x2", str(qty))).outcome == "blocked"  # never sell twice
+        assert env.broker.placed_count == 1

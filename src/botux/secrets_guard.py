@@ -27,8 +27,10 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?i)((?:api[_-]?key|api[_-]?secret|secret[_-]?key|secret|token|password|passwd)"
         r"['\"]?\s*[:=]\s*['\"]?)[^\s,'\"}&]+"
     ),
-    # Binance API keys / HMAC secrets are 64 alphanumeric characters.
-    re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{64}(?![A-Za-z0-9])"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
+    # Binance API keys / HMAC secrets are 64 alphanumeric characters; scrub any long run so that
+    # off-by-one lengths and truncated keys are caught too.
+    re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{40,}(?![A-Za-z0-9])"),
 )
 
 

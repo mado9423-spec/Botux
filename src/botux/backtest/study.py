@@ -117,13 +117,15 @@ def run_study(
             f"only {report.test_metrics.trades} trades in the test segment: far too few for the "
             "numbers to mean anything statistically"
         )
-    if (
-        report.train_metrics
-        and report.test_metrics.total_return < report.train_metrics.total_return
-    ):
-        report.warnings.append(
-            "test return is below train return: a typical sign of over-fitting or regime change"
-        )
+    if report.train_metrics:
+        # Compare per-candle returns: the segments have different lengths, so raw totals mislead.
+        train_rate = report.train_metrics.total_return / report.train_candles
+        test_rate = report.test_metrics.total_return / report.test_candles
+        if train_rate > 0 and test_rate < 0.5 * train_rate:
+            report.warnings.append(
+                "the per-candle test return is less than half of the train return: a typical "
+                "sign of over-fitting or of a change in market regime"
+            )
     report.warnings.append(
         "a single instrument, a single split and a single time span: results can be luck and say "
         "nothing about the future. Costs are modelled, but real fills, latency and outages are not."

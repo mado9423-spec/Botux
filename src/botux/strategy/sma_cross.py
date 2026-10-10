@@ -17,6 +17,10 @@ from botux.errors import ConfigError
 from botux.models import Candle
 from botux.strategy.base import Signal
 
+# The live loop reads at most 1000 klines per request (including the still-forming candle), so the
+# slow window plus warm-up must fit comfortably.
+MAX_SLOW = 900
+
 
 class SmaCross:
     name = "sma_cross"
@@ -24,8 +28,8 @@ class SmaCross:
     def __init__(self, fast: int = 20, slow: int = 50) -> None:
         if not (isinstance(fast, int) and isinstance(slow, int)):
             raise ConfigError("sma_cross: fast and slow must be integers")
-        if not 2 <= fast < slow <= 1000:
-            raise ConfigError("sma_cross: require 2 <= fast < slow <= 1000")
+        if not 2 <= fast < slow <= MAX_SLOW:
+            raise ConfigError(f"sma_cross: require 2 <= fast < slow <= {MAX_SLOW}")
         self.fast = fast
         self.slow = slow
         self.warmup = slow + 1  # need slow+1 closes to compare the previous and current state

@@ -305,7 +305,11 @@ class TestMarketData:
 
     def test_only_closed_drops_the_forming_candle(self) -> None:
         c = candles_from_closes([100, 101, 102])
-        assert only_closed(c, c[-1].open_time_ms + 5) == c[:-1]
+        t = c[-1].open_time_ms  # the third candle has just opened
+        assert only_closed(c, t + 3000) == c[:-1]  # forming candle dropped
+        # the second candle closed only 5 ms ago: inside the 2 s grace period it is not trusted yet
+        assert only_closed(c, t + 5) == c[:-2]
+        assert only_closed(c, t + 5, grace_ms=0) == c[:-1]
 
     def test_parse_klines_and_malformed_rows(self) -> None:
         c = candles_from_closes([100, 101])

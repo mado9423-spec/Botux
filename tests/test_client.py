@@ -22,7 +22,12 @@ from botux.errors import (
     OutcomeUnknownError,
     RateLimitError,
 )
-from botux.exchange.client import ENDPOINTS, BinanceSpotClient, hmac_signature
+from botux.exchange.client import (
+    ENDPOINTS,
+    TIMESTAMP_SAFETY_MS,
+    BinanceSpotClient,
+    hmac_signature,
+)
 from botux.secrets_guard import Credentials, Secret
 from tests.conftest import FakeExchange
 
@@ -106,7 +111,7 @@ class TestSigning:
         assert c.sync_time() == 400
         c.account()
         sent = int(parse_qs(ex.requests[-1].url.query.decode())["timestamp"][0])
-        assert sent == clock.now_ms() + 400
+        assert sent == clock.now_ms() + 400 - TIMESTAMP_SAFETY_MS
 
 
 class TestAllowList:
@@ -321,6 +326,11 @@ class TestOrdersAreNeverBlindlyRetried:
             httpx.Response(504, text="gateway timeout"),
             httpx.Response(400, json={"code": -1006, "msg": "unexpected response"}),
             httpx.Response(500, json={"code": -1001, "msg": "Internal error"}),
+            httpx.Response(408, text="request timeout"),
+            httpx.Response(499, text="client closed request"),
+            httpx.Response(400, text="<html>proxy error page</html>"),
+            httpx.Response(302, headers={"location": "https://elsewhere.example"}),
+            httpx.Response(200, text="not json at all"),
         ],
     )
     def test_ambiguous_answers_raise_unknown_outcome_after_one_request(
@@ -401,7 +411,8 @@ class TestClockSkew:
             lambda _r: httpx.Response(200, json={"serverTime": clock.now_ms() + 300}),
         )
         make_client(ex, clock).account()
-        assert ex.count("/api/v3/time") == 1 and ex.count("/api/v3/account") == 2
+        assert ex.count("/api/v3/time") == 3  # one resync = 3 samples
+        assert ex.count("/api/v3/account") == 2
 
     def test_minus_1021_on_an_order_is_not_retried(self, clock: FakeClock) -> None:
         ex = FakeExchange()
@@ -410,10 +421,51 @@ class TestClockSkew:
             "/api/v3/order",
             lambda _r: httpx.Response(400, json={"code": -1021, "msg": "ts"}),
         )
+        ex.on(
+            "GET",
+            "/api/v3/time",
+            lambda _r: httpx.Response(200, json={"serverTime": clock.now_ms() + 200}),
+        )
         c = make_client(ex, clock, trading=True)
         with pytest.raises(ClockSkewError):
             c.new_order(**order_kwargs())  # type: ignore[arg-type]
-        assert len(ex.requests) == 1
+        assert ex.count("/api/v3/order") == 1  # the order itself is never re-sent
+        assert ex.count("/api/v3/time") == 3  # but the clock is re-measured for the next request
+        assert c.clock_offset_ms == 200
+
+    def test_clock_is_resynchronised_periodically_before_signed_requests(
+        self, clock: FakeClock
+    ) -> None:
+        ex = FakeExchange()
+        ex.on(
+            "GET",
+            "/api/v3/time",
+            lambda _r: httpx.Response(200, json={"serverTime": clock.now_ms()}),
+        )
+        ex.on("GET", "/api/v3/account", {"balances": []})
+        c = make_client(ex, clock)
+        c.sync_time()
+        before = ex.count("/api/v3/time")
+        c.account()
+        assert ex.count("/api/v3/time") == before  # fresh enough
+        clock.advance(700)
+        c.account()
+        assert ex.count("/api/v3/time") == before + 1
+
+    def test_sync_prefers_the_lowest_latency_sample(self, clock: FakeClock) -> None:
+        ex = FakeExchange()
+        delays = iter(
+            [2000, 40, 1500]
+        )  # round trips in ms; the 40 ms sample is the trustworthy one
+        offsets = iter([900, 20, -800])
+
+        def slow_time(_r: httpx.Request) -> httpx.Response:
+            clock.advance(next(delays) / 1000)
+            return httpx.Response(200, json={"serverTime": clock.now_ms() + next(offsets) - 20})
+
+        ex.on("GET", "/api/v3/time", slow_time)
+        c = make_client(ex, clock, creds=False, max_clock_skew_ms=2500)
+        assert abs(c.sync_time() - 0) <= 25  # taken from the 40 ms round trip, not the others
 
 
 class TestQueries:

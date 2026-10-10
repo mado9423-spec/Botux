@@ -8,8 +8,8 @@ Fill model (deliberately pessimistic and simple):
   the base asset (so you receive slightly less than you bought), SELL pays it in the quote asset.
 * The same exchange filters as the real venue are applied, so a quantity that would be rejected
   live is rejected here too.
-* Binance semantics are mimicked on purpose: an order id equal to an OPEN order is rejected
-  ("Duplicate order sent"), but an id equal to a FILLED order is accepted again.
+* Binance semantics are mimicked on purpose: an order id is rejected as a duplicate unless the
+  previous order with that id was FILLED ("accepted only when the previous one is filled").
 * ``FaultPlan`` injects rejections, timeouts (executed or not) and outages so that the order
   manager's handling of uncertain outcomes can be exercised without a real exchange.
 """
@@ -133,7 +133,9 @@ class PaperBroker:
         if rules is None:
             raise self._reject("Invalid symbol.", -1121)
         existing = self._orders.get(req.client_order_id)
-        if existing is not None and not existing.status.is_terminal:
+        if existing is not None and existing.status is not OrderStatus.FILLED:
+            # Binance: an id is reusable only once the previous order is FILLED (not when it was
+            # cancelled, expired or is still open).
             raise self._reject("Duplicate order sent.", -2010)
         quote = self._quotes.get(req.symbol)
         if quote is None:

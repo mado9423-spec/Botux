@@ -19,7 +19,8 @@ from botux.exchange.rules import SymbolRules
 from botux.execution.order_manager import OrderIntent
 from botux.execution.paper import FaultKind
 from botux.killswitch import KillSwitch
-from botux.models import Candle, OrderStatus, OrderType, Quote, Side
+from botux.models import Candle, Fill, OrderStatus, OrderType, Quote, Side
+from botux.risk.manager import PortfolioView
 from botux.storage import OrderRecord, Store
 from botux.strategy.base import Signal
 from tests.conftest import HOUR_MS, T0, FakeExchange, candles_from_closes
@@ -386,3 +387,243 @@ class TestUnconfirmedOrdersInTheLoop:
         (buy,) = h.orders()
         assert buy.status is OrderStatus.FILLED and h.paper.placed_count == 1
         assert h.loop.positions.get("BTCUSDT") is not None
+
+
+def uncertain_buy(store: Store, now_ms: int) -> None:
+    """An unresolved BUY on the symbol: blocks entries (but must never block exits)."""
+    store.insert_order(
+        OrderRecord(
+            "unresolved1",
+            "k-unresolved",
+            "BTCUSDT",
+            Side.BUY,
+            OrderType.MARKET,
+            D("0.1"),
+            None,
+            OrderStatus.UNKNOWN,
+            now_ms,
+            now_ms,
+        )
+    )
+
+
+def enter_long(h: Harness) -> None:
+    h.cycle()
+    h.cycle(hours=1)  # candle 4 closes -> BUY
+    assert h.paper.balances()["BTC"].free > 0
+
+
+class TestProtectionNeverDependsOnTheRestOfTheLoop:
+    def test_stop_loss_fires_while_an_unresolved_buy_blocks_entries(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        enter_long(h)
+        uncertain_buy(store, h.clock.now_ms())
+        h.feed.bid, h.feed.ask = D("90.00"), D("90.01")
+        h.loop.run_cycle()
+        assert any(
+            o.intent_key.startswith("stop:") and o.status is OrderStatus.FILLED for o in h.orders()
+        )
+        assert h.paper.balances()["BTC"].free < rules.min_qty
+
+    def test_stop_loss_fires_even_when_the_candle_feed_is_broken(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        enter_long(h)
+        h.feed.error = DataError("klines unavailable")
+        h.feed.bid, h.feed.ask = D("90.00"), D("90.01")
+        h.loop.run_cycle()  # the cycle is reported as failed ...
+        assert h.loop.risk.consecutive_errors == 1
+        assert any(o.intent_key.startswith("stop:") for o in h.orders())  # ... but the stop ran
+        assert h.paper.balances()["BTC"].free < rules.min_qty
+
+    def test_flatten_on_kill_works_with_an_unresolved_buy(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        cfg2 = dataclasses.replace(cfg, risk=dataclasses.replace(cfg.risk, flatten_on_kill=True))
+        h = harness(cfg2, rules, store)
+        enter_long(h)
+        uncertain_buy(store, h.clock.now_ms())
+        KillSwitch(cfg.paths.kill_file).trip("flatten")
+        h.loop.run_cycle()
+        assert h.paper.balances()["BTC"].free < rules.min_qty and h.loop.stopped
+
+    def test_a_garbage_kill_file_still_stops_the_bot(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        cfg2 = dataclasses.replace(cfg, risk=dataclasses.replace(cfg.risk, flatten_on_kill=True))
+        h = harness(cfg2, rules, store)
+        enter_long(h)
+        Path(cfg.paths.kill_file).write_text("1")  # `echo 1 > KILL`
+        h.loop.run_cycle()
+        assert h.loop.stopped and h.paper.balances()["BTC"].free < rules.min_qty
+
+    def test_a_position_without_recorded_entry_gets_a_stop_re_armed(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        enter_long(h)
+        h.loop.positions.clear("BTCUSDT")  # e.g. lost between the fill and its bookkeeping
+        h.loop.run_cycle()
+        assert h.loop.positions.get("BTCUSDT") is not None
+        assert "Stop-loss re-armed" in h.notifier.titles()
+
+    def test_failed_exits_raise_a_critical_alert_without_spamming(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        enter_long(h)
+        h.paper.faults.push(FaultKind.REJECT, times=3)
+        h.feed.bid, h.feed.ask = D("90.00"), D("90.01")
+        h.loop.run_cycle()
+        h.clock.advance(61)  # next minute bucket -> a fresh stop order is attempted
+        h.loop.run_cycle()
+        assert h.notifier.titles().count("Exit order did not go through") == 1  # throttled
+        assert h.paper.balances()["BTC"].free > 0  # still long: the alert is the safety net
+
+    def test_error_driven_halt_with_an_open_position_says_so(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        cfg2 = dataclasses.replace(
+            cfg, risk=dataclasses.replace(cfg.risk, max_consecutive_errors=2)
+        )
+        h = harness(cfg2, rules, store)
+        enter_long(h)
+        h.feed.error = DataError("down")
+        h.loop.run_cycle()
+        h.loop.run_cycle()
+        msg = next(m for _, t, m in h.notifier.items if t == "Trading halted")
+        assert "WITHOUT STOP PROTECTION" in msg and "BTCUSDT" in msg
+
+
+class TestBookkeepingAndBaseline:
+    def test_locked_coins_of_the_user_are_never_sold(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        h.paper._free["BTC"] = D("0.5")
+        h.paper._locked["BTC"] = D("0.5")  # 0.5 BTC sit in the user's own resting order
+        enter_long(h)
+        assert h.loop.positions.get("BTCUSDT") is not None
+        h.paper._free["BTC"] += D("0.5")  # the user cancels his order: coins become free
+        h.paper._locked["BTC"] = D(0)
+        for _ in range(4):
+            h.cycle(hours=1)  # the strategy exit happens at candle 8
+        sells = [o for o in h.orders() if o.side is Side.SELL]
+        assert sells and all(o.quantity < D("1") for o in sells)  # only the bot's own ~0.99 BTC
+        assert h.paper.balances()["BTC"].free >= D(1)  # the user's 1 BTC is untouched
+
+    def test_entry_price_is_the_volume_weighted_average_of_all_fills(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        h.cycle()
+        rec = OrderRecord(
+            "c1",
+            "k1",
+            "BTCUSDT",
+            Side.BUY,
+            OrderType.MARKET,
+            D("2"),
+            None,
+            OrderStatus.FILLED,
+            0,
+            0,
+            executed_qty=D("2"),
+            cumulative_quote_qty=D("210"),
+        )
+        h.loop.on_fill(
+            rec, [Fill(D("100"), D("1"), D(0), "BTC"), Fill(D("110"), D("1"), D(0), "BTC")]
+        )
+        info = h.loop.positions.get("BTCUSDT")
+        assert info is not None and info.entry_price == D("105")  # not 100 (the first fill)
+
+    def test_a_partial_sell_keeps_the_stop_on_the_remainder(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        enter_long(h)
+        rec = OrderRecord(
+            "c2",
+            "k2",
+            "BTCUSDT",
+            Side.SELL,
+            OrderType.MARKET,
+            D("0.9"),
+            None,
+            OrderStatus.EXPIRED,
+            0,
+            0,
+            executed_qty=D("0.4"),
+            cumulative_quote_qty=D("40"),
+        )
+        h.loop.on_fill(rec, [Fill(D("100"), D("0.4"), D(0), "USDT")])
+        assert h.loop.positions.get("BTCUSDT") is not None  # most of the position is still open
+
+    def test_a_stale_kline_answer_does_not_trigger_trades(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        enter_long(h)
+        n = len(h.orders())
+        h.feed.all = h.candles[:4]  # one poll returns an OLDER set of candles (candle 3 is last)
+        h.feed.mark_to_last_close()
+        h.clock.advance(60)
+        h.loop.run_cycle()
+        assert len(h.orders()) == n  # no spurious SELL decided on old data
+
+    def test_a_provably_unsent_entry_is_retried_on_the_same_candle(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        h.cycle()
+        h.paper.faults.push(FaultKind.NETWORK_DOWN)
+        h.cycle(hours=1)  # BUY signal, but the network is down: nothing was sent
+        assert h.orders() == [] and h.paper.placed_count == 0
+        h.loop.run_cycle()  # same candle again: the decision was not burned
+        assert [o.side for o in h.orders()] == [Side.BUY] and h.paper.placed_count == 1
+
+    def test_retries_per_candle_are_bounded(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        h.cycle()
+        h.paper.faults.push(FaultKind.NETWORK_DOWN, times=10)
+        h.cycle(hours=1)
+        for _ in range(6):
+            h.loop.run_cycle()
+        assert h.orders() == [] and h.paper.placed_count == 0
+        assert (
+            len(h.paper.faults._queue) == 10 - 3
+        )  # attempted exactly MAX_RETRIES_PER_CANDLE times
+
+
+class TestLiveGateWhileRunning:
+    def test_closing_the_gate_halts_entries_but_keeps_exits(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        enter_long(h)
+        from botux.errors import LiveTradingNotAllowed
+
+        def closed() -> None:
+            raise LiveTradingNotAllowed("arming expired")
+
+        h.loop._gate_check = closed
+        h.loop.run_cycle()
+        assert h.loop.risk.hard_halt_reason and "arming expired" in h.loop.risk.hard_halt_reason
+        assert "Live gate closed" in h.notifier.titles()
+        # entries are impossible now ...
+        assert h.loop.risk.size_entry(rules, D(100), _view()).quantity == 0
+        # ... yet an existing position is still protected
+        h.feed.bid, h.feed.ask = D("90.00"), D("90.01")
+        h.loop.run_cycle()
+        assert any(o.intent_key.startswith("stop:") for o in h.orders())
+        h.loop.run_cycle()
+        assert h.notifier.titles().count("Live gate closed") == 1
+
+
+def _view() -> PortfolioView:
+    return PortfolioView(D(1000), D(1000), {"BTCUSDT": D(0)}, {"BTCUSDT": D(0)})

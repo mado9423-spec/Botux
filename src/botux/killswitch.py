@@ -41,9 +41,11 @@ class KillSwitch:
             return self._reason
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-            return str(data.get("reason", "kill file present"))
         except (OSError, ValueError):
             return "kill file present"
+        if isinstance(data, dict):
+            return str(data.get("reason", "kill file present"))
+        return "kill file present"  # e.g. `echo 1 > KILL`: any content still means STOP
 
     def trip(self, reason: str) -> None:
         """Set the switch. The in-memory flag is set even if the file cannot be written."""

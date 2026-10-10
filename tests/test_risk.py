@@ -52,12 +52,21 @@ def halted(rm: RiskManager) -> bool:
 
 class TestSizing:
     def test_risk_per_trade_is_the_binding_limit(self, rules: SymbolRules) -> None:
-        # equity 1000 * 0.5% = 5 USDT at risk; stop 2% of 60000 = 1200/BTC -> 0.0041666 -> 0.00416
+        # equity 1000 * 0.5% = 5 USDT at risk. Loss per BTC if the stop is hit = 2% stop distance
+        # + slippage (2 x 0.05%) + fees (2 x 0.1%) = 2.3% of 60000 = 1380 -> 0.003623 -> 0.00362
         res = make_rm().size_entry(rules, PRICE, view())
         assert res.binding == "risk_per_trade"
-        assert res.quantity == D("0.00416")
-        # worst-case loss at the stop does not exceed the budget
-        assert res.quantity * PRICE * D("0.02") <= D("1000") * D("0.005")
+        assert res.quantity == D("0.00362")
+        # the worst case INCLUDING trading costs stays inside the risk budget
+        assert res.quantity * PRICE * D("0.023") <= D("1000") * D("0.005")
+
+    def test_positions_that_could_not_be_sold_again_are_refused(self, rules: SymbolRules) -> None:
+        # 25 USDT equity -> 0.00009 BTC (5.4 USDT, passes the buy-side minimum), but after the
+        # 0.1% fee only 0.00008 BTC (4.8 USDT) would be sellable: below MIN_NOTIONAL, so a
+        # stop-loss could never be executed. The entry must not be opened.
+        res = make_rm().size_entry(rules, PRICE, view(equity="25", free="25"))
+        assert res.quantity == 0
+        assert any("could not be sold again" in r for r in res.reasons)
 
     def test_hard_notional_cap_binds_before_risk(self, rules: SymbolRules) -> None:
         res = make_rm(max_order_notional=D(100)).size_entry(rules, PRICE, view())

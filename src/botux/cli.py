@@ -113,6 +113,14 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     interval_ms = SUPPORTED_INTERVALS[interval]
     if args.data:
         candles = load_csv(Path(args.data))
+        if len(candles) > 1:
+            data_interval_ms = candles[1].open_time_ms - candles[0].open_time_ms
+            if data_interval_ms != interval_ms:
+                print(
+                    f"note: the CSV has {data_interval_ms // 60_000}-minute candles; using that "
+                    f"instead of the configured {interval}"
+                )
+                interval_ms = data_interval_ms
     else:
         now = SystemClock().now_ms() + client.sync_time()
         candles = _download(client, symbol, interval, args.days, now)

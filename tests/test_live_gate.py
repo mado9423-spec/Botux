@@ -94,6 +94,7 @@ def live_exchange(clock: FakeClock, restrictions: dict[str, object] | None = Non
         dict(GOOD_KEY if restrictions is None else restrictions),
     )
     ex.on("GET", "/api/v3/exchangeInfo", EXCHANGE_INFO_BTCUSDT)
+    ex.on("GET", "/api/v3/account", {"canTrade": True, "balances": []})
 
     def new_order(req: httpx.Request) -> httpx.Response:
         body = parse_qs(req.content.decode())
@@ -377,6 +378,19 @@ class TestMockedLiveBringUp:
         assert ex.count("/api/v3/order") == 0
 
 
+class TestMoreBringUpGuards:
+    def test_account_that_cannot_trade_is_refused(
+        self, settings: Settings, clock: FakeClock, store: Store
+    ) -> None:
+        s = live(settings)
+        arm(s, clock)
+        ex = live_exchange(clock)
+        ex.on("GET", "/api/v3/account", {"canTrade": False, "balances": []})
+        with pytest.raises(LiveTradingNotAllowed, match="canTrade"):
+            build_live_app(s, ENV, http=ex.http(), clock=clock, store=store)
+        assert ex.count("/api/v3/order") == 0
+
+
 class TestLiveBroker:
     def client(
         self, ex: FakeExchange, clock: FakeClock, *, trading: bool = True
@@ -443,6 +457,70 @@ class TestLiveBroker:
             lambda _r: httpx.Response(400, json={"code": -2011, "msg": "Unknown order sent."}),
         )
         assert b.cancel_order("BTCUSDT", "c1") is None
+
+    def test_unreadable_answer_to_an_order_is_an_unknown_outcome(
+        self, clock: FakeClock, rules: SymbolRules
+    ) -> None:
+        ex = FakeExchange()
+        b = self.broker(ex, clock, rules)
+        ex.on("POST", "/api/v3/order", {"unexpected": "shape"})  # 200 but not an order
+        with pytest.raises(OutcomeUnknownError):
+            b.place_order(self.req())
+
+    def test_clock_skew_is_not_disguised_as_a_rejection(
+        self, clock: FakeClock, rules: SymbolRules
+    ) -> None:
+        from botux.errors import ClockSkewError as Skew
+
+        ex = FakeExchange()
+        ex.on(
+            "GET",
+            "/api/v3/time",
+            lambda _r: httpx.Response(200, json={"serverTime": clock.now_ms()}),
+        )
+        ex.on(
+            "POST",
+            "/api/v3/order",
+            lambda _r: httpx.Response(400, json={"code": -1021, "msg": "ts"}),
+        )
+        with pytest.raises(Skew):
+            self.broker(ex, clock, rules).place_order(self.req())
+
+    def test_cancel_answer_is_identified_by_the_original_client_id(self) -> None:
+        # Official doc sample: `clientOrderId` is the cancel's own id, `origClientOrderId` is ours.
+        got = parse_order(
+            {
+                "symbol": "LTCBTC",
+                "origClientOrderId": "myOrder1",
+                "clientOrderId": "cancelMyOrder1",
+                "orderId": 4,
+                "side": "BUY",
+                "type": "LIMIT",
+                "status": "CANCELED",
+                "origQty": "1",
+                "executedQty": "0",
+                "cummulativeQuoteQty": "0",
+                "price": "2.00000000",
+            }
+        )
+        assert got.client_order_id == "myOrder1" and got.price == D("2")
+
+    def test_zero_price_and_negative_cumulative_quote_are_normalised(self) -> None:
+        got = parse_order(
+            {
+                "symbol": "BTCUSDT",
+                "clientOrderId": "c",
+                "orderId": 1,
+                "side": "BUY",
+                "type": "MARKET",
+                "status": "FILLED",
+                "origQty": "1",
+                "executedQty": "1",
+                "cummulativeQuoteQty": "-1.00000000",
+                "price": "0.0",
+            }
+        )
+        assert got.price is None and got.cumulative_quote_qty == 0 and got.avg_price == 0
 
     def test_parse_order_statuses_and_unknown_fallback(self) -> None:
         base = {

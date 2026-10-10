@@ -102,9 +102,18 @@ def validate_live_candles(
         raise DataError(f"market data is stale: last closed candle is {age / 1000:.0f}s old")
 
 
-def only_closed(candles: Sequence[Candle], now_ms: int) -> list[Candle]:
-    """Drop the still-forming candle (its close time is in the future)."""
-    return [c for c in candles if c.close_time_ms < now_ms]
+CLOSE_GRACE_MS = 2_000
+
+
+def only_closed(
+    candles: Sequence[Candle], now_ms: int, grace_ms: int = CLOSE_GRACE_MS
+) -> list[Candle]:
+    """Drop the still-forming candle, plus one that closed less than ``grace_ms`` ago.
+
+    REST klines carry no "closed" flag and tolerated clock skew can reach one second, so a
+    candle is trusted only after a short grace period (its final values could still change).
+    """
+    return [c for c in candles if c.close_time_ms < now_ms - grace_ms]
 
 
 def fetch_range(

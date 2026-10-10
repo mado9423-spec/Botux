@@ -170,7 +170,8 @@ class RiskManager:
         pos_notional = view.positions_notional.get(sym, ZERO)
         total_exposure = sum(view.positions_notional.values(), ZERO)
         risk_budget = view.equity * self.s.risk_per_trade_pct
-        loss_per_unit = price * self.s.stop_loss_pct
+        # Loss if the stop is hit: the stop distance plus slippage and fees on BOTH legs.
+        loss_per_unit = price * (self.s.stop_loss_pct + 2 * self._slip + 2 * self._fee)
         candidates: dict[str, Decimal] = {
             "risk_per_trade": risk_budget / loss_per_unit,
             "max_order_notional": self.s.max_order_notional / price,
@@ -199,6 +200,22 @@ class RiskManager:
                 ZERO,
                 binding,
                 ("sized quantity is below exchange minimums and will NOT be rounded up", *problems),
+            )
+        # The position must be closable: after the buy fee, what is left to sell, valued at the
+        # stop level, still has to satisfy the exchange minimums (otherwise a stop-loss could
+        # never be executed). Dust positions are refused rather than opened.
+        sellable = rules.round_qty(qty * (1 - self._fee), OrderType.MARKET)
+        exit_problems = rules.violations(
+            Side.SELL, OrderType.MARKET, sellable, None, price * (1 - self.s.stop_loss_pct)
+        )
+        if sellable <= 0 or exit_problems:
+            return SizingResult(
+                ZERO,
+                binding,
+                (
+                    "the position could not be sold again at the stop level (exchange minimums)",
+                    *exit_problems,
+                ),
             )
         return SizingResult(qty, binding)
 

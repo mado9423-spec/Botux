@@ -22,7 +22,14 @@ from decimal import Decimal
 
 from botux.alerts import Notifier
 from botux.clock import Clock, SystemClock
-from botux.errors import ExchangeError, NetworkError, OrderRejected, OutcomeUnknownError
+from botux.errors import (
+    ClockSkewError,
+    ExchangeError,
+    NetworkError,
+    OrderRejected,
+    OutcomeUnknownError,
+    RateLimitError,
+)
 from botux.exchange.rules import SymbolRules
 from botux.execution.broker import Broker
 from botux.killswitch import KillSwitch
@@ -100,9 +107,19 @@ class OrderManager:
     def open_orders(self, symbol: str | None = None) -> list[OrderRecord]:
         return self._store.list_orders(OPEN_STATUSES, symbol)
 
-    def is_symbol_blocked(self, symbol: str) -> str | None:
-        """Reason string when no new order may be sent for ``symbol``, else None."""
-        if self.uncertain_orders(symbol):
+    def is_symbol_blocked(self, symbol: str, *, for_exit: bool = False) -> str | None:
+        """Reason string when no new order may be sent for ``symbol``, else None.
+
+        Entries are blocked while ANY order on the symbol is unresolved or was LOST. Exits are
+        blocked only while an unresolved SELL exists (to avoid selling twice): an unresolved BUY
+        must never stop a stop-loss, because sells are sized from the real balance.
+        """
+        uncertain = self.uncertain_orders(symbol)
+        if for_exit:
+            if any(o.side is Side.SELL for o in uncertain):
+                return f"unresolved SELL on {symbol}: reconciling first"
+            return None
+        if uncertain:
             return f"unresolved order(s) on {symbol}: reconciling first"
         if self._store.kv_get(f"lost:{symbol}"):
             return (
@@ -122,7 +139,7 @@ class OrderManager:
         now = self._clock.now_ms()
         if self._kill is not None and self._kill.is_set() and not intent.is_exit:
             return SubmitResult("blocked", None, "kill switch is set")
-        blocked = self.is_symbol_blocked(intent.symbol)
+        blocked = self.is_symbol_blocked(intent.symbol, for_exit=intent.is_exit)
         if blocked:
             return SubmitResult("blocked", None, blocked)
         existing = self._store.get_by_intent(intent.intent_key)
@@ -168,18 +185,34 @@ class OrderManager:
             result = self._broker.place_order(request)
         except OrderRejected as exc:
             return self._finish_rejected(record, f"rejected: {exc}")
+        except (ClockSkewError, RateLimitError) as exc:
+            # Refused before the matching engine (timestamp window / rate limit / local cool-down):
+            # provably not executed, and worth retrying shortly.
+            return self._finish_retry_later(record, f"{type(exc).__name__}: {exc}")
         except NetworkError as exc:
             if exc.not_sent:
-                return self._finish_rejected(record, f"not sent: {exc}")
+                return self._finish_retry_later(record, f"not sent: {exc}")
             return self._finish_uncertain(record, str(exc))
         except OutcomeUnknownError as exc:
             return self._finish_uncertain(record, str(exc))
         except ExchangeError as exc:
-            # 4XX / rate limit / geo block / clock skew on an order => it was refused, not executed.
+            # Other 4XX / geo block / WAF block on an order => it was refused, not executed.
             return self._finish_rejected(record, f"{type(exc).__name__}: {exc}")
 
         self._apply(record, result)
         return SubmitResult("accepted", record, "")
+
+    def _finish_retry_later(self, record: OrderRecord, note: str) -> SubmitResult:
+        """Forget an order that provably never left, so the same intent can be tried again."""
+        self._store.delete_unsent_order(record.client_order_id)
+        self._store.log_event(
+            self._clock.now_ms(),
+            "WARNING",
+            "order_not_sent",
+            {"id": record.client_order_id, "note": note},
+        )
+        log.warning("order %s %s not sent (will retry): %s", record.symbol, record.side, note)
+        return SubmitResult("retry_later", None, note)
 
     def _finish_rejected(self, record: OrderRecord, note: str) -> SubmitResult:
         record.status = OrderStatus.REJECTED
@@ -255,24 +288,30 @@ class OrderManager:
             return  # try again next cycle; do not count a failed query as 'not found'
         if result is not None:
             self._apply(record, result)
+            if (
+                record.status in UNCERTAIN_STATUSES
+            ):  # the venue answered with a status we cannot read
+                self._count_failed_attempt(record, "venue reports an unrecognised status")
             return
         if record.status in UNCERTAIN_STATUSES or record.status in OPEN_STATUSES:
-            record.reconcile_attempts += 1
-            record.updated_ms = self._clock.now_ms()
-            if record.reconcile_attempts >= self._max_attempts:
-                record.status = OrderStatus.LOST
-                record.note = (record.note + " | not found on venue after reconciliation")[:500]
-                self._store.update_order(record)
-                self._store.kv_set(f"lost:{record.symbol}", record.client_order_id)
-                self._notifier.notify(
-                    "CRITICAL",
-                    "Order LOST",
-                    f"{record.symbol} {record.side} {record.quantity} id={record.client_order_id} "
-                    "could not be found on the venue. It will NOT be re-sent. Check the exchange, "
-                    "then run 'botux resolve-lost'.",
-                )
-            else:
-                self._store.update_order(record)
+            self._count_failed_attempt(record, "not found on venue after reconciliation")
+
+    def _count_failed_attempt(self, record: OrderRecord, why: str) -> None:
+        record.reconcile_attempts += 1
+        record.updated_ms = self._clock.now_ms()
+        if record.reconcile_attempts < self._max_attempts:
+            self._store.update_order(record)
+            return
+        record.status = OrderStatus.LOST
+        record.note = f"{record.note} | {why}"[:500]
+        self._store.update_order(record)
+        self._store.kv_set(f"lost:{record.symbol}", record.client_order_id)
+        self._notifier.notify(
+            "CRITICAL",
+            "Order LOST",
+            f"{record.symbol} {record.side} {record.quantity} id={record.client_order_id}: {why}. "
+            "It will NOT be re-sent. Check the exchange, then run 'botux resolve-lost'.",
+        )
 
     def reconcile_pending(self) -> None:
         """One reconciliation pass over every uncertain or open order (call every cycle)."""

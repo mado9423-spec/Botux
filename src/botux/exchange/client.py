@@ -53,6 +53,11 @@ from botux.secrets_guard import Credentials
 
 log = logging.getLogger(__name__)
 
+# Binance rejects a timestamp more than 1 s AHEAD of its clock, but tolerates one up to recvWindow
+# behind. We therefore deliberately stamp requests slightly in the past.
+TIMESTAMP_SAFETY_MS = 300
+RESYNC_INTERVAL_S = 600.0
+
 # Error codes whose meaning is "we do not know whether the request was executed".
 UNKNOWN_OUTCOME_CODES = frozenset({-1000, -1001, -1006, -1007, -1008})
 
@@ -210,6 +215,7 @@ class BinanceSpotClient:
         self._window = _WeightWindow(self._clock, max_weight_per_minute)
         self._max_skew_ms = max_clock_skew_ms
         self._offset_ms = 0
+        self._last_sync: float | None = None
         self._cooldown_until = 0.0
         self._cooldown_exc: type[RateLimitError] = RateLimitError
         self._rng = rng or random.Random()  # noqa: S311 - jitter only, not security-sensitive
@@ -255,7 +261,7 @@ class BinanceSpotClient:
     # ------------------------------------------------------------------ transport
 
     def _timestamp(self) -> int:
-        return self._clock.now_ms() + self._offset_ms
+        return self._clock.now_ms() + self._offset_ms - TIMESTAMP_SAFETY_MS
 
     def _sign(self, params: Mapping[str, Any]) -> str:
         assert self._credentials is not None  # guarded by _check_allowed
@@ -315,7 +321,14 @@ class BinanceSpotClient:
             self.last_used_weight_1m = int(used)
         status = resp.status_code
         if status == 200:
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError:
+                if ep.safe_to_retry:
+                    raise _ServerError(f"{ep.name}: unreadable 200 response") from None
+                raise OutcomeUnknownError(
+                    f"{ep.name}: unreadable 200 response; execution status unknown"
+                ) from None
 
         code: int | None = None
         msg = ""
@@ -343,7 +356,12 @@ class BinanceSpotClient:
         if status == 403:
             self._start_cooldown(retry_after or 30.0, RateLimitError)
             raise APIError(f"HTTP 403 (WAF block or rate-limit violation): {msg}", http_status=403)
-        if status >= 500 or code in UNKNOWN_OUTCOME_CODES:
+        # On a state-changing endpoint only a 4xx that carries a parsed Binance {"code": ...} body
+        # (and is not a timeout-ish 408/499) proves the request was refused. Anything else - a
+        # 5XX, a proxy's HTML page, a redirect, an unparsable body - leaves the outcome unknown.
+        refused = 400 <= status < 500 and code is not None and status not in (408, 499)
+        transient = status >= 500 or status in (408, 499) or code in UNKNOWN_OUTCOME_CODES
+        if transient or (not ep.safe_to_retry and not refused):
             if ep.safe_to_retry:
                 raise _ServerError(f"{ep.name}: server error {status} code={code} {msg}")
             raise OutcomeUnknownError(
@@ -363,14 +381,17 @@ class BinanceSpotClient:
         resynced = False
         for attempt in range(attempts):
             self._check_cooldown()
+            self._maybe_resync(ep)
             self._window.reserve(ep.weight)
             try:
                 return self._send_once(ep, params)
             except ClockSkewError:
-                if ep.security is Security.NONE or resynced or not ep.safe_to_retry:
+                if ep.security is Security.NONE or resynced:
                     raise
                 resynced = True
-                self.sync_time()
+                self.sync_time()  # heal the offset for the next request
+                if not ep.safe_to_retry:
+                    raise  # an order is never re-sent here; the caller decides what to do
             except (NetworkError, _ServerError) as exc:
                 if attempt + 1 >= attempts:
                     if isinstance(exc, _ServerError):
@@ -396,18 +417,38 @@ class BinanceSpotClient:
     def server_time_ms(self) -> int:
         return int(self._call("time")["serverTime"])
 
-    def sync_time(self) -> int:
-        """Measure local-vs-server clock offset (ms) and use it for signed requests."""
-        t0 = self._clock.now_ms()
-        server = self.server_time_ms()
-        t1 = self._clock.now_ms()
-        self._offset_ms = server - (t0 + t1) // 2
+    def sync_time(self, samples: int = 3) -> int:
+        """Measure local-vs-server clock offset (ms) and use it for signed requests.
+
+        Several samples are taken and the one with the smallest round trip wins (its midpoint
+        assumption is the most accurate). Too large an offset is refused outright.
+        """
+        best: tuple[int, int] | None = None  # (round trip ms, offset ms)
+        for _ in range(max(1, samples)):
+            t0 = self._clock.now_ms()
+            server = self.server_time_ms()
+            t1 = self._clock.now_ms()
+            candidate = (t1 - t0, server - (t0 + t1) // 2)
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+        assert best is not None
+        self._offset_ms = best[1]
+        self._last_sync = self._clock.monotonic()
         if abs(self._offset_ms) > self._max_skew_ms:
             raise ClockSkewError(
                 f"local clock is off by {self._offset_ms} ms (limit {self._max_skew_ms} ms); "
                 "fix NTP before trading"
             )
         return self._offset_ms
+
+    def _maybe_resync(self, ep: Endpoint) -> None:
+        """Refresh the clock offset every RESYNC_INTERVAL_S before a signed request."""
+        if (
+            ep.security is not Security.NONE
+            and self._last_sync is not None
+            and self._clock.monotonic() - self._last_sync > RESYNC_INTERVAL_S
+        ):
+            self.sync_time(samples=1)
 
     def exchange_info(self, symbol: str) -> dict[str, Any]:
         return dict(self._call("exchange_info", {"symbol": symbol}))

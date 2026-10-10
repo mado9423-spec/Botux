@@ -3,8 +3,12 @@
 Reference: https://github.com/binance/binance-spot-api-docs/blob/master/filters.md
 
 We validate every order locally against PRICE_FILTER, LOT_SIZE, MARKET_LOT_SIZE,
-MIN_NOTIONAL / NOTIONAL, PERCENT_PRICE(_BY_SIDE) and MAX_NUM_ORDERS *before* it is sent, so
-that a violation never costs an API call, and quantities are always rounded DOWN.
+MIN_NOTIONAL / NOTIONAL and PERCENT_PRICE(_BY_SIDE) *before* it is sent, so that a violation
+never costs an API call, and quantities are always rounded DOWN. MAX_NUM_ORDERS is parsed for
+information only: the bot's own ``max_open_orders`` limit is far lower than any exchange value.
+(EXCHANGE_MAX_NUM_ORDERS and iceberg/algo filters are not used because the bot never places such
+orders.) The exchange evaluates NOTIONAL/PERCENT_PRICE against its own reference price; ours is
+an approximation, hence the configurable safety buffer on minimum notionals.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ class SymbolRules:
     # MIN_NOTIONAL / NOTIONAL
     min_notional: Decimal = ZERO
     apply_min_to_market: bool = True
+    extra_min_notionals: tuple[tuple[Decimal, bool], ...] = ()  # second minimum, if both exist
     max_notional: Decimal = ZERO
     apply_max_to_market: bool = False
     # PERCENT_PRICE / PERCENT_PRICE_BY_SIDE (None = absent)
@@ -84,22 +89,20 @@ class SymbolRules:
                 "market_max_qty": D(f["maxQty"]),
                 "market_step_size": D(f["stepSize"]),
             }
-        min_notional = ZERO
-        apply_min = True
+        # MIN_NOTIONAL and NOTIONAL are evaluated independently by the exchange; if a symbol has
+        # both we keep both minimums (the first pair is the primary, the second goes to `extra`).
+        minimums: list[tuple[Decimal, bool]] = []
         if (f := filters.get("MIN_NOTIONAL")) is not None:
-            min_notional = D(f["minNotional"])
-            apply_min = bool(f.get("applyToMarket", True))
+            minimums.append((D(f["minNotional"]), bool(f.get("applyToMarket", True))))
         if (f := filters.get("NOTIONAL")) is not None:
-            # Both may be present on some symbols: obey the stricter minimum.
-            new_min = D(f["minNotional"])
-            if new_min >= min_notional:
-                min_notional = new_min
-                apply_min = bool(f.get("applyMinToMarket", True))
+            minimums.append((D(f["minNotional"]), bool(f.get("applyMinToMarket", True))))
             kw |= {
                 "max_notional": D(f["maxNotional"]),
                 "apply_max_to_market": bool(f.get("applyMaxToMarket", False)),
             }
-        kw |= {"min_notional": min_notional, "apply_min_to_market": apply_min}
+        if minimums:
+            kw |= {"min_notional": minimums[0][0], "apply_min_to_market": minimums[0][1]}
+            kw["extra_min_notionals"] = tuple(minimums[1:])
         if (f := filters.get("PERCENT_PRICE")) is not None:
             up, down = D(f["multiplierUp"]), D(f["multiplierDown"])
             kw |= {
@@ -230,12 +233,14 @@ class SymbolRules:
             problems.append("no reference price available to evaluate notional filters")
         else:
             notional = quantity * eff_price
-            check_min = order_type is OrderType.LIMIT or self.apply_min_to_market
-            if self.min_notional and check_min and notional < self.min_notional * notional_buffer:
-                problems.append(
-                    f"Filter failure: NOTIONAL (notional {notional:.8f} < "
-                    f"{self.min_notional * notional_buffer:.8f} incl. safety buffer)"
-                )
+            minimums = [(self.min_notional, self.apply_min_to_market), *self.extra_min_notionals]
+            for minimum, applies_to_market in minimums:
+                applies = order_type is OrderType.LIMIT or applies_to_market
+                if minimum and applies and notional < minimum * notional_buffer:
+                    problems.append(
+                        f"Filter failure: NOTIONAL (notional {notional:.8f} < "
+                        f"{minimum * notional_buffer:.8f} incl. safety buffer)"
+                    )
             check_max = order_type is OrderType.LIMIT or self.apply_max_to_market
             if self.max_notional and check_max and notional > self.max_notional:
                 problems.append(

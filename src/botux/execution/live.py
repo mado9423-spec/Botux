@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -16,7 +16,14 @@ import httpx
 from botux.clock import Clock, SystemClock
 from botux.config import Settings, load_credentials
 from botux.decimals import ZERO, D
-from botux.errors import APIError, LiveTradingNotAllowed, OrderRejected
+from botux.errors import (
+    APIError,
+    ClockSkewError,
+    ExchangeError,
+    LiveTradingNotAllowed,
+    OrderRejected,
+    OutcomeUnknownError,
+)
 from botux.exchange.client import BinanceSpotClient
 from botux.exchange.rules import SymbolRules
 from botux.killswitch import KillSwitch
@@ -50,8 +57,11 @@ CANCEL_REJECTED = -2011
 
 
 def parse_order(payload: Mapping[str, Any]) -> OrderResult:
-    """Map a Binance order JSON (ACK/RESULT/FULL or GET /order) to :class:`OrderResult`."""
-    price = D(payload["price"]) if payload.get("price") not in (None, "", "0.00000000") else None
+    """Map a Binance order JSON (ACK/RESULT/FULL, GET /order, DELETE /order) to OrderResult."""
+    raw_price = payload.get("price")
+    price = D(raw_price) if raw_price not in (None, "") else None
+    if price is not None and price <= 0:
+        price = None  # MARKET orders report 0.00000000
     fills = [
         Fill(
             D(f["price"]),
@@ -62,22 +72,29 @@ def parse_order(payload: Mapping[str, Any]) -> OrderResult:
         for f in payload.get("fills", [])
     ]
     status = _STATUS_MAP.get(str(payload.get("status", "")), OrderStatus.UNKNOWN)
+    cumulative = D(payload.get("cummulativeQuoteQty", "0"))  # sic: Binance's spelling
+    if cumulative < 0:
+        cumulative = ZERO  # docs: negative means "not available" for some historical orders
+    order_type = str(payload.get("type", ""))
+    # For a cancel response `clientOrderId` is the CANCEL's own id; `origClientOrderId` is ours.
+    client_id = payload.get("origClientOrderId") or payload.get("clientOrderId")
     return OrderResult(
-        client_order_id=str(payload.get("clientOrderId") or payload.get("origClientOrderId")),
+        client_order_id=str(client_id),
         symbol=str(payload["symbol"]),
         side=Side(payload["side"]),
-        type=OrderType(payload["type"])
-        if payload["type"] in OrderType.__members__
-        else OrderType.MARKET,
+        type=OrderType.LIMIT if order_type.startswith("LIMIT") else OrderType.MARKET,
         status=status,
         orig_qty=D(payload.get("origQty", "0")),
         executed_qty=D(payload.get("executedQty", "0")),
-        cumulative_quote_qty=D(payload.get("cummulativeQuoteQty", "0")),  # sic: Binance's spelling
+        cumulative_quote_qty=cumulative,
         price=price,
         exchange_order_id=None if payload.get("orderId") is None else str(payload["orderId"]),
         transact_time_ms=int(payload.get("transactTime") or payload.get("updateTime") or 0),
         fills=fills,
     )
+
+
+_PARSE_ERRORS = (KeyError, ValueError, TypeError, InvalidOperation)
 
 
 class LiveBroker:
@@ -112,9 +129,17 @@ class LiveBroker:
                 price=request.price,
                 client_order_id=request.client_order_id,
             )
+        except ClockSkewError:
+            raise  # rejected before the matching engine; the order manager may retry later
         except APIError as exc:  # definitive 4XX answer from the API: not executed
             raise OrderRejected(f"{exc.code}: {exc}", code=exc.code) from exc
-        return parse_order(payload)
+        try:
+            return parse_order(payload)
+        except _PARSE_ERRORS as exc:
+            # The venue answered but we cannot read it: the order may well exist.
+            raise OutcomeUnknownError(
+                f"unreadable order response ({type(exc).__name__}); execution status unknown"
+            ) from None
 
     def get_order(self, symbol: str, client_order_id: str) -> OrderResult | None:
         try:
@@ -123,6 +148,8 @@ class LiveBroker:
             if exc.code == NO_SUCH_ORDER:
                 return None
             raise
+        except _PARSE_ERRORS as exc:
+            raise ExchangeError(f"unreadable order answer ({type(exc).__name__})") from None
 
     def cancel_order(self, symbol: str, client_order_id: str) -> OrderResult | None:
         try:
@@ -131,9 +158,14 @@ class LiveBroker:
             if exc.code in (CANCEL_REJECTED, NO_SUCH_ORDER):
                 return None
             raise
+        except _PARSE_ERRORS as exc:
+            raise ExchangeError(f"unreadable cancel answer ({type(exc).__name__})") from None
 
     def open_orders(self, symbol: str) -> list[OrderResult]:
-        return [parse_order(o) for o in self._client.open_orders(symbol)]
+        try:
+            return [parse_order(o) for o in self._client.open_orders(symbol)]
+        except _PARSE_ERRORS as exc:
+            raise ExchangeError(f"unreadable open-orders answer ({type(exc).__name__})") from None
 
     def balances(self) -> dict[str, Balance]:
         out: dict[str, Balance] = {}
@@ -174,6 +206,9 @@ def build_live_broker(
     if problems:
         client.close()
         raise LiveTradingNotAllowed("API key refused: " + "; ".join(problems))
+    if client.account().get("canTrade") is not True:
+        client.close()
+        raise LiveTradingNotAllowed("the account reports canTrade != true; refusing to start")
     rules = {
         sym: SymbolRules.from_exchange_info(client.exchange_info(sym), sym)
         for sym in settings.market.symbols
