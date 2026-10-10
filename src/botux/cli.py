@@ -13,6 +13,7 @@ import os
 import signal
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import FrameType
@@ -20,7 +21,7 @@ from types import FrameType
 from botux import __version__
 from botux.app import App, build_live_app, build_paper_app, public_client
 from botux.backtest.metrics import format_metrics
-from botux.backtest.study import run_study
+from botux.backtest.study import run_study, run_walk_forward
 from botux.clock import SystemClock
 from botux.config import (
     SUPPORTED_INTERVALS,
@@ -137,6 +138,66 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     rules = SymbolRules.from_exchange_info(client.exchange_info(symbol), symbol)
 
     grid = DEFAULT_GRIDS.get(s.strategy.name, {})
+    first, last = candles[0].open_time_ms, candles[-1].close_time_ms
+    days = (last - first) / 86_400_000
+    utc = "%Y-%m-%d"
+    deployed = min(s.risk.max_order_notional, s.risk.max_position_notional, args.cash)
+    print(
+        f"\n{symbol} {interval}: {len(candles)} candles over {days:.0f} days, "
+        f"{datetime.fromtimestamp(first / 1000, UTC):{utc}} to "
+        f"{datetime.fromtimestamp(last / 1000, UTC):{utc}} (UTC)"
+    )
+    print("Assumptions (all approximations, none of them guarantees):")
+    print(
+        f"  - data: public klines of {symbol}, checked for duplicates, gaps and disorder; "
+        "orders execute at the NEXT candle's open (no look-ahead)"
+    )
+    print(
+        f"  - costs: fee {s.execution.fee_rate} per fill (check your own tier), slippage "
+        f"{s.execution.slippage_bps} bps against you on every fill; no spread or depth model, "
+        "complete fills, no latency or outages"
+    )
+    print(
+        f"  - capital: start {args.cash} {s.risk.quote_asset}; at most {deployed} is deployed "
+        "(order/position caps), so the buy&hold baselines are scaled to the same capital"
+    )
+    print(
+        "  - exchange filters are today's, not historical; the daily-loss halt is reset "
+        "automatically each UTC day (the live bot needs a human)"
+    )
+    if args.walk_forward:
+        wf = run_walk_forward(
+            candles,
+            rules,
+            s.risk,
+            strategy_name=s.strategy.name,
+            grid=grid,
+            initial_cash=args.cash,
+            fee_rate=s.execution.fee_rate,
+            slippage_bps=s.execution.slippage_bps,
+            interval_ms=interval_ms,
+            folds=args.folds,
+        )
+        print(f"\nWalk-forward ({len(wf.folds)} folds; parameters chosen on the past only):")
+        for fold in wf.folds:
+            print(
+                f"  fold {fold.index}: chose {fold.params} | train {fold.train.total_return:+.2%} "
+                f"-> out-of-sample {fold.test.total_return:+.2%} "
+                f"(same-capital buy&hold {fold.test.buy_and_hold_same_capital:+.2%}, "
+                f"trades {fold.test.trades}, max drawdown {fold.test.max_drawdown:.2%})"
+            )
+        print(
+            f"Chained out-of-sample return {wf.chained_return:+.2%} | same-capital buy&hold "
+            f"{wf.chained_baseline_same_capital:+.2%} | scaled to time in market "
+            f"{wf.chained_baseline_exposure_matched:+.2%} | trades {wf.trades} | "
+            f"worst fold drawdown {wf.worst_drawdown:.2%} | distinct choices {wf.distinct_choices}"
+        )
+        print("\nLimitations:")
+        for w in wf.warnings:
+            print(f"  - {w}")
+        print("\nThis is an educational simulation, not advice, and not a prediction.")
+        return 0
+
     study = run_study(
         candles,
         rules,
@@ -149,17 +210,11 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         slippage_bps=s.execution.slippage_bps,
         interval_ms=interval_ms,
         train_fraction=args.train_fraction,
-    )
-    first, last = candles[0].open_time_ms, candles[-1].close_time_ms
-    days = (last - first) / 86_400_000
-    print(
-        f"\n{symbol} {interval}: {len(candles)} candles over {days:.0f} days "
-        f"(train {study.train_candles} / test {study.test_candles})"
+        validation_fraction=args.validation_fraction,
     )
     print(
-        f"costs assumed: fee {s.execution.fee_rate} per fill, "
-        f"slippage {s.execution.slippage_bps} bps; "
-        f"start cash {args.cash} {s.risk.quote_asset}"
+        f"Split (chronological): train {study.train_candles} / validation "
+        f"{study.validation_candles} / test {study.test_candles} candles"
     )
     print(f"\nParameter search on TRAIN data only ({len(study.grid)} combinations):")
     for params, m in sorted(study.grid, key=lambda pm: pm[1].total_return, reverse=True):
@@ -167,18 +222,28 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             f"  {params}: return {m.total_return:+.2%}, trades {m.trades}, "
             f"max drawdown {m.max_drawdown:.2%}"
         )
+    if study.shortlist:
+        print("\nShort list judged on VALIDATION data (the test data is still untouched):")
+        for params, train_m, val_m in study.shortlist:
+            print(
+                f"  {params}: train {train_m.total_return:+.2%} -> validation "
+                f"{val_m.total_return:+.2%}, trades {val_m.trades}"
+            )
     print(
         f"\nChosen parameters: {study.chosen_params}"
         f"{'' if study.chosen_from_grid else '  (default; grid gave no eligible result)'}"
     )
     if study.train_metrics:
-        print("TRAIN result of the chosen parameters (in-sample, optimistic by construction):")
+        print("TRAIN result (in-sample, optimistic by construction):")
         print(format_metrics(study.train_metrics))
+    if study.validation_metrics:
+        print("VALIDATION result (used to pick among the short list):")
+        print(format_metrics(study.validation_metrics))
     if study.test_metrics:
         print("TEST result of the chosen parameters (out-of-sample, evaluated once):")
         print(format_metrics(study.test_metrics))
     if study.default_test_metrics:
-        print(f"TEST result of the default parameters {study.default_params}:")
+        print(f"TEST result of the default parameters {study.default_params} (reference only):")
         print(format_metrics(study.default_test_metrics))
     print("\nLimitations:")
     for w in study.warnings:
@@ -416,7 +481,14 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--data", default=None, help="CSV from 'fetch-data' instead of downloading")
     b.add_argument("--save", default=None, help="save the downloaded candles to this CSV")
     b.add_argument("--cash", type=Decimal, default=Decimal(1000))
-    b.add_argument("--train-fraction", type=float, default=0.7)
+    b.add_argument("--train-fraction", type=float, default=0.5)
+    b.add_argument("--validation-fraction", type=float, default=0.2)
+    b.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="rolling choose-on-the-past / judge-on-the-next-window test instead of one split",
+    )
+    b.add_argument("--folds", type=int, default=5)
     b.set_defaults(func=cmd_backtest)
 
     pp = sub.add_parser("paper", help="run the trading loop in PAPER mode (simulated fills)")

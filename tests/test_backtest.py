@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from botux.backtest.engine import BacktestResult, run_backtest
 from botux.backtest.metrics import compute_metrics, format_metrics
-from botux.backtest.study import run_study, split_train_test
+from botux.backtest.study import run_study, run_walk_forward, split_three
 from botux.config import RiskSettings
 from botux.data.market import (
     check_candles,
@@ -25,7 +26,7 @@ from botux.errors import ConfigError, DataError
 from botux.exchange.client import BinanceSpotClient
 from botux.exchange.rules import SymbolRules
 from botux.models import Candle
-from botux.strategy.base import Signal, create_strategy
+from botux.strategy.base import Signal, Strategy, create_strategy
 from botux.strategy.sma_cross import SmaCross
 from tests.conftest import HOUR_MS, T0, FakeExchange, candles_from_closes, kline_rows, make_candle
 
@@ -186,7 +187,11 @@ class TestMetrics:
         assert m.trades == 1 and m.win_rate == 0.0 and m.profit_factor == 0.0
         assert m.total_return < 0 and 0 < m.max_drawdown < 0.05
         assert 0 < m.exposure < 1
-        assert "return" in format_metrics(m)
+        text = format_metrics(m)
+        assert "return" in text and "scaled to this run's time in market" in text
+        assert m.buy_and_hold_exposure_matched == pytest.approx(
+            m.buy_and_hold_same_capital * m.exposure
+        )
 
     def test_buy_and_hold_baseline_uses_the_same_capital_as_the_strategy(
         self, rules: SymbolRules
@@ -222,77 +227,212 @@ class TestStudy:
             closes.append(round(price, 2))
         return candles_from_closes(closes)
 
-    def test_split_is_chronological_and_disjoint(self) -> None:
-        c = self.wavy(500)
-        train, test = split_train_test(c, 0.7)
-        assert len(train) + len(test) == 500
-        assert train[-1].open_time_ms < test[0].open_time_ms
-        with pytest.raises(ConfigError):
-            split_train_test(c, 0.95)
+    def study(self, rules: SymbolRules, candles: list[Candle], **kw: object):  # type: ignore[no-untyped-def]
+        args = {
+            "strategy_name": "sma_cross",
+            "default_params": {"fast": 5, "slow": 20},
+            "grid": {"fast": [5, 10], "slow": [20, 40]},
+            "initial_cash": D(1000),
+            "fee_rate": D("0.001"),
+            "slippage_bps": D(5),
+            "interval_ms": HOUR_MS,
+        } | kw
+        return run_study(candles, rules, RiskSettings(), **args)  # type: ignore[arg-type]
 
-    def test_parameters_are_chosen_on_train_and_judged_on_test(
+    def test_split_is_chronological_disjoint_and_leaves_a_test_segment(self) -> None:
+        c = self.wavy(500)
+        train, val, test = split_three(c, 0.5, 0.2)
+        assert len(train) + len(val) + len(test) == 500
+        assert train[-1].open_time_ms < val[0].open_time_ms < val[-1].open_time_ms
+        assert val[-1].open_time_ms < test[0].open_time_ms
+        for bad in ((0.95, 0.2), (0.5, 0.05), (0.7, 0.3), (0.2, 0.2)):
+            with pytest.raises(ConfigError):
+                split_three(c, *bad)
+
+    def test_each_segment_only_sees_what_it_is_allowed_to(
         self, rules: SymbolRules, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        c = self.wavy(600)
-        train, test = split_train_test(c, 0.7)
-        ranges: list[tuple[int, int, int]] = []
+        c = self.wavy(900)
+        train, val, test = split_three(c, 0.5, 0.2)
+        seen: list[tuple[int, int, int]] = []
         real = run_backtest
 
         def spy(segment: Sequence[Candle], *a: object, **k: object) -> BacktestResult:
-            ranges.append((len(segment), segment[0].open_time_ms, segment[-1].open_time_ms))
+            seen.append((len(segment), segment[0].open_time_ms, segment[-1].open_time_ms))
             return real(segment, *a, **k)  # type: ignore[arg-type]
 
         monkeypatch.setattr("botux.backtest.study.run_backtest", spy)
-        report = run_study(
-            c,
-            rules,
-            RiskSettings(),
-            strategy_name="sma_cross",
-            default_params={"fast": 5, "slow": 20},
-            grid={"fast": [5, 10], "slow": [20, 40]},
-            initial_cash=D(1000),
-            fee_rate=D("0.001"),
-            slippage_bps=D(5),
-            interval_ms=HOUR_MS,
-        )
-        train_runs = [r for r in ranges if r[2] <= train[-1].open_time_ms]
-        test_runs = [r for r in ranges if r[1] >= test[0].open_time_ms]
-        assert len(train_runs) >= 4  # the whole grid ran on train data only
-        assert len(test_runs) == 2  # chosen + default parameters, once each, on test data only
-        assert len(train_runs) + len(test_runs) == len(ranges)  # nothing straddles the boundary
+        report = self.study(rules, c)
+        in_train = [r for r in seen if r[2] <= train[-1].open_time_ms]
+        in_val = [r for r in seen if val[0].open_time_ms <= r[1] and r[2] <= val[-1].open_time_ms]
+        in_test = [r for r in seen if r[1] >= test[0].open_time_ms]
+        assert len(in_train) == 4  # the whole grid, on train data only
+        assert 1 <= len(in_val) <= 3  # only the short list reaches the validation segment
+        assert len(in_test) == 2  # the chosen parameters and the defaults, once each
+        assert len(in_train) + len(in_val) + len(in_test) == len(seen)  # nothing straddles a border
         assert report.test_metrics is not None and report.default_test_metrics is not None
+        assert report.validation_metrics is not None and report.shortlist
         assert any("parameter combinations" in w for w in report.warnings)
         assert any("single instrument" in w for w in report.warnings)
 
-    def test_too_little_data_is_refused(self, rules: SymbolRules) -> None:
-        with pytest.raises(DataError):
-            run_study(
-                self.wavy(100),
-                rules,
-                RiskSettings(),
-                strategy_name="sma_cross",
-                default_params={"fast": 5, "slow": 20},
-                grid={},
-                initial_cash=D(1000),
-                fee_rate=D(0),
-                slippage_bps=D(0),
-                interval_ms=HOUR_MS,
-            )
+    def test_the_winner_is_picked_on_validation_not_on_train(self, rules: SymbolRules) -> None:
+        report = self.study(rules, self.wavy(1200))
+        best_val = max(v.total_return for _, _, v in report.shortlist)
+        chosen = [v for p, _, v in report.shortlist if p == report.chosen_params]
+        assert chosen and chosen[0].total_return == best_val
 
-    def test_few_trades_trigger_a_warning(self, rules: SymbolRules) -> None:
-        report = run_study(
-            self.wavy(400),
+    def test_look_back_comes_from_the_past_and_nothing_after_the_segment(
+        self, rules: SymbolRules
+    ) -> None:
+        c = self.wavy(600)
+        cut = 400
+        seen_last: list[int] = []
+
+        class Spy:
+            name = "spy"
+            warmup = 25
+
+            def on_candles(self, candles: Sequence[Candle], in_position: bool) -> Signal:
+                seen_last.append(candles[-1].open_time_ms)
+                return Signal.HOLD
+
+        run_backtest(
+            c[cut:],
+            Spy(),
             rules,
             RiskSettings(),
-            strategy_name="sma_cross",
-            default_params={"fast": 5, "slow": 20},
-            grid={"fast": [5], "slow": [20]},
             initial_cash=D(1000),
-            fee_rate=D("0.001"),
-            slippage_bps=D(5),
+            fee_rate=D(0),
+            slippage_bps=D(0),
             interval_ms=HOUR_MS,
+            history=c[:cut],
         )
+        # the strategy is consulted for every candle of the segment (so no cold start) ...
+        assert seen_last[0] == c[cut].open_time_ms
+        # ... and never sees a candle later than the one that has just closed
+        assert seen_last == [x.open_time_ms for x in c[cut:-1]]
+
+    def test_a_warm_segment_trades_where_a_cold_one_cannot(self, rules: SymbolRules) -> None:
+        c = candles_from_closes([100] * 10 + [101, 103, 104, 104, 100, 96, 96])
+
+        def strat() -> Strategy:
+            return create_strategy("sma_cross", {"fast": 2, "slow": 8})
+
+        common = {
+            "initial_cash": D(1000),
+            "fee_rate": D(0),
+            "slippage_bps": D(0),
+            "interval_ms": HOUR_MS,
+        }
+        # only the last 7 candles are tested; with 8 needed to warm up, a cold start has no signal
+        cold = run_backtest(c[10:], strat(), rules, RiskSettings(), **common)  # type: ignore[arg-type]
+        warm = run_backtest(c[10:], strat(), rules, RiskSettings(), history=c[:10], **common)  # type: ignore[arg-type]
+        assert cold.trades == [] and len(warm.trades) == 1
+
+    def test_too_little_data_is_refused(self, rules: SymbolRules) -> None:
+        with pytest.raises(DataError):
+            self.study(rules, self.wavy(100), grid={})
+
+    def test_few_trades_trigger_a_warning(self, rules: SymbolRules) -> None:
+        report = self.study(rules, self.wavy(700), grid={"fast": [5], "slow": [20]})
         assert any("far too few" in w for w in report.warnings)
+
+    def test_no_skill_is_called_out_when_a_matched_buy_and_hold_does_as_well(
+        self, rules: SymbolRules
+    ) -> None:
+        c = candles_from_closes([100 + i * 0.5 for i in range(700)])  # a steady uptrend
+        report = self.study(rules, c, grid={"fast": [5], "slow": [20]})
+        assert report.test_metrics is not None
+        assert report.test_metrics.buy_and_hold_exposure_matched >= 0
+        assert report.chosen_params
+
+    def test_the_daily_loss_halt_is_reset_each_utc_day_in_a_backtest(
+        self, rules: SymbolRules
+    ) -> None:
+        # Day 1: a long position is stopped out, which trips the (tiny) daily loss limit.
+        # Day 2: a fresh rally gives a new entry signal; the halt must not outlive the day,
+        # because a back-test has no human to reset it (the live bot does need one).
+        day_ms = 86_400_000
+        start = (T0 // day_ms + 1) * day_ms  # a UTC midnight
+        day1 = [100] * 4 + [101, 103, 104, 104, 100, 90, 90] + [90] * 13
+        day2 = [90] * 3 + [92, 95, 98, 99] + [99] * 17
+        assert len(day1) == len(day2) == 24
+        candles = candles_from_closes(day1 + day2, start=start)
+        res = run(candles, rules, risk=RiskSettings(max_daily_loss=D("0.5")))
+        days = [t.entry_time_ms // day_ms for t in res.trades]
+        assert days.count(start // day_ms) >= 1  # traded (and lost) on day 1
+        assert days.count(start // day_ms + 1) >= 1  # and was allowed to trade again on day 2
+
+
+class TestWalkForward:
+    def study_kwargs(self) -> dict[str, Any]:
+        return {
+            "strategy_name": "sma_cross",
+            "grid": {"fast": [5, 10], "slow": [20, 40]},
+            "initial_cash": D(1000),
+            "fee_rate": D("0.001"),
+            "slippage_bps": D(5),
+            "interval_ms": HOUR_MS,
+        }
+
+    def test_windows_are_chronological_and_each_choice_sees_only_the_past(
+        self, rules: SymbolRules, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = TestStudy.wavy(1500)
+        seen: list[tuple[int, int]] = []
+        real = run_backtest
+
+        def spy(segment: Sequence[Candle], *a: object, **k: object) -> BacktestResult:
+            seen.append((segment[0].open_time_ms, segment[-1].open_time_ms))
+            return real(segment, *a, **k)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("botux.backtest.study.run_backtest", spy)
+        wf = run_walk_forward(c, rules, RiskSettings(), folds=4, **self.study_kwargs())
+        assert len(wf.folds) == 4
+        starts = [f.test_range[0] for f in wf.folds]
+        assert starts == sorted(starts) and len(set(starts)) == 4
+        grid_size = 4  # 2 x 2 combinations, each run once per fold on the training window only
+        for k, f in enumerate(wf.folds):
+            assert f.train_range[1] == f.test_range[0]  # the test window starts where training ends
+            train_win = (c[f.train_range[0]].open_time_ms, c[f.train_range[1] - 1].open_time_ms)
+            test_win = (c[f.test_range[0]].open_time_ms, c[f.test_range[1] - 1].open_time_ms)
+            calls = seen[k * (grid_size + 1) : (k + 1) * (grid_size + 1)]
+            assert calls[:grid_size] == [train_win] * grid_size  # the search saw training data only
+            assert calls[grid_size] == test_win  # the choice was judged once, on unseen data
+        assert wf.trades == sum(f.test.trades for f in wf.folds)
+        assert any("fills, latency" in w for w in wf.warnings)
+
+    def test_chained_return_compounds_the_folds(self, rules: SymbolRules) -> None:
+        c = TestStudy.wavy(1500)
+        wf = run_walk_forward(c, rules, RiskSettings(), folds=3, **self.study_kwargs())
+        expected = 1.0
+        for f in wf.folds:
+            expected *= 1 + f.test.total_return
+        assert wf.chained_return == pytest.approx(expected - 1)
+
+    def test_unstable_choices_and_few_trades_are_flagged(self, rules: SymbolRules) -> None:
+        c = TestStudy.wavy(1500)
+        wf = run_walk_forward(c, rules, RiskSettings(), folds=4, **self.study_kwargs())
+        assert wf.distinct_choices >= 1
+        assert any("far too few" in w for w in wf.warnings) == (wf.trades < 30)
+
+    def test_bad_arguments_and_too_little_data(self, rules: SymbolRules) -> None:
+        c = TestStudy.wavy(1500)
+        with pytest.raises(ConfigError):
+            run_walk_forward(c, rules, RiskSettings(), folds=1, **self.study_kwargs())
+        with pytest.raises(ConfigError):
+            run_walk_forward(
+                c,
+                rules,
+                RiskSettings(),
+                folds=3,
+                train_fraction=0.9,
+                **self.study_kwargs(),
+            )
+        with pytest.raises(DataError):
+            run_walk_forward(
+                TestStudy.wavy(300), rules, RiskSettings(), folds=5, **self.study_kwargs()
+            )
 
 
 class TestMarketData:

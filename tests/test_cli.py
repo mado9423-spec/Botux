@@ -233,3 +233,41 @@ def test_status_lists_why_new_entries_are_blocked(
     assert main(["-c", cfg_path, "status"]) == 0
     out = capsys.readouterr().out
     assert "NEW ENTRIES BLOCKED [balance:BTC]: BTC differs by +0.3" in out
+
+
+def test_backtest_walk_forward_and_report_content(
+    cfg_path: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closes = []
+    price = 100.0
+    for i in range(1500):
+        price *= 1 + (0.004 if (i // 40) % 2 == 0 else -0.004)
+        closes.append(round(price, 2))
+    csv = tmp_path / "data.csv"
+    save_csv(csv, candles_from_closes(closes))
+    ex = FakeExchange()
+    ex.on("GET", "/api/v3/exchangeInfo", EXCHANGE_INFO_BTCUSDT)
+    ex.on("GET", "/api/v3/time", {"serverTime": 1})
+    monkeypatch.setattr(cli, "public_client", lambda _s, **_k: BinanceSpotClient(http=ex.http()))
+
+    assert main(["-c", cfg_path, "backtest", "--data", str(csv)]) == 0
+    out = capsys.readouterr().out
+    for needle in (
+        "Assumptions",
+        "NEXT candle's open",
+        "Split (chronological): train",
+        "Short list judged on VALIDATION data",
+        "VALIDATION result",
+        "TEST result of the chosen parameters",
+        "scaled to this run's time in market",
+        "UTC",
+    ):
+        assert needle in out, needle
+
+    assert main(["-c", cfg_path, "backtest", "--data", str(csv), "--walk-forward"]) == 0
+    out = capsys.readouterr().out
+    for needle in ("Walk-forward (", "fold 1:", "Chained out-of-sample return", "Limitations"):
+        assert needle in out, needle

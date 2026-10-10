@@ -9,7 +9,11 @@ Conventions (chosen to avoid optimistic bias):
 * Stop-loss: if a candle's low touches the stop, we exit at the stop price, or at the open if
   the candle gaps below it, then add slippage. If the entry candle itself touches the stop we
   assume it was hit (pessimistic).
-* Sizing and limits use the same :class:`RiskManager` as the live loop.
+* Sizing and limits use the same :class:`RiskManager` as the live loop. The live bot keeps a
+  tripped daily-loss halt until a human resets it; a back-test has no human, so it models the
+  reset as happening at the next UTC day (a simplification, stated in the report).
+* ``history`` (candles BEFORE the tested segment) only feeds the strategy's look-back so that a
+  validation/test segment does not start "cold"; nothing is traded or valued on it.
 
 Known limits: exchange filters are today's, not historical; fills are assumed complete (no
 order-book depth); no latency; no outages. Real results will differ, usually for the worse.
@@ -68,6 +72,7 @@ def run_backtest(
     fee_rate: Decimal,
     slippage_bps: Decimal,
     interval_ms: int,
+    history: Sequence[Candle] = (),
 ) -> BacktestResult:
     slip = slippage_bps / Decimal(10_000)
     clock = FakeClock()
@@ -117,8 +122,16 @@ def run_backtest(
         trade_fees = ZERO
 
     n = len(candles)
+    lookback = list(history[-strategy.warmup :]) if strategy.warmup > 0 else []
+    seen = lookback + list(candles)  # what the strategy may look at (never beyond candle i)
+    offset = len(lookback)
+    day = -1
     for i, c in enumerate(candles):
         clock.set_ms(c.open_time_ms)
+        if c.open_time_ms // 86_400_000 != day:
+            day = c.open_time_ms // 86_400_000
+            if rm.daily_loss_halted:  # modelled human reset, see the module docstring
+                rm.reset_daily_loss(cash + base * c.open)
         # 1) execute the order decided at the previous close, at this candle's open
         if pending is Signal.ENTER_LONG and not holding():
             mark = c.open
@@ -154,8 +167,8 @@ def run_backtest(
             res.candles_in_position += 1
         rm.update_equity(c.close_time_ms, equity)
         if i + 1 < n:
-            lo = max(0, i + 1 - strategy.warmup)
-            pending = strategy.on_candles(candles[lo : i + 1], holding())
+            lo = max(0, offset + i + 1 - strategy.warmup)
+            pending = strategy.on_candles(seen[lo : offset + i + 1], holding())
 
     if holding():  # close at the final close so every trade is accounted for
         last = candles[-1]

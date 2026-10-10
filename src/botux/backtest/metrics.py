@@ -16,6 +16,7 @@ class Metrics:
     total_return: float
     buy_and_hold_return: float
     buy_and_hold_same_capital: float
+    buy_and_hold_exposure_matched: float  # same-capital baseline scaled to the time in market
     max_drawdown: float
     trades: int
     win_rate: float | None
@@ -56,16 +57,18 @@ def compute_metrics(res: BacktestResult) -> Metrics:
             if var > 0:
                 sharpe = mean / math.sqrt(var) * math.sqrt(YEAR_MS / res.interval_ms)
 
+    exposure = res.candles_in_position / res.candles_total if res.candles_total else 0.0
     return Metrics(
         total_return=total_return,
         buy_and_hold_return=res.buy_and_hold_return,
         buy_and_hold_same_capital=res.buy_and_hold_same_capital,
+        buy_and_hold_exposure_matched=res.buy_and_hold_same_capital * exposure,
         max_drawdown=max_dd,
         trades=len(pnls),
         win_rate=win_rate,
         profit_factor=profit_factor,
         avg_trade_pnl=avg,
-        exposure=res.candles_in_position / res.candles_total if res.candles_total else 0.0,
+        exposure=exposure,
         sharpe=sharpe,
         fees_paid=float(res.fees_paid),
         final_equity=final,
@@ -83,9 +86,10 @@ def format_metrics(m: Metrics) -> str:
         return "n/a" if x is None else ("inf" if math.isinf(x) else f"{x:.2f}")
 
     return (
-        f"  return {signed(m.total_return)} | buy&hold same capital "
-        f"{signed(m.buy_and_hold_same_capital)} (100% invested: {signed(m.buy_and_hold_return)}) | "
-        f"max drawdown {m.max_drawdown:.2%}\n"
+        f"  return {signed(m.total_return)} | baselines: buy&hold same capital "
+        f"{signed(m.buy_and_hold_same_capital)}, scaled to this run's time in market "
+        f"{signed(m.buy_and_hold_exposure_matched)} (100% invested: "
+        f"{signed(m.buy_and_hold_return)}) | max drawdown {m.max_drawdown:.2%}\n"
         f"  trades {m.trades} | win rate {plain(m.win_rate)} | "
         f"profit factor {num(m.profit_factor)} | avg trade PnL {num(m.avg_trade_pnl)}\n"
         f"  exposure {m.exposure:.1%} | Sharpe(ann., rf=0) {num(m.sharpe)} | "
