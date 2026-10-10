@@ -168,6 +168,9 @@ class LiveBroker:
         except _PARSE_ERRORS as exc:
             raise ExchangeError(f"unreadable open-orders answer ({type(exc).__name__})") from None
 
+    def update_rules(self, rules: Mapping[str, SymbolRules]) -> None:
+        self._rules.update(rules)
+
     def order_fills(self, symbol: str, exchange_order_id: str) -> list[Fill]:
         try:
             trades = self._client.my_trades(symbol, int(exchange_order_id))

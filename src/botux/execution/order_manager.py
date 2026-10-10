@@ -123,6 +123,9 @@ class OrderManager:
     def set_entry_guard(self, guard: EntryGuard) -> None:
         self._entry_guard = guard
 
+    def update_rules(self, rules: Mapping[str, SymbolRules]) -> None:
+        self._rules.update(rules)
+
     def set_fill_callback(self, callback: FillCallback) -> None:
         self._on_fill = callback
 

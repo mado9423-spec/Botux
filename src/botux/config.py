@@ -98,6 +98,7 @@ class MarketSettings:
     trading_base_url: str = "https://api.binance.com"
     poll_seconds: float = 30.0
     max_candle_age_factor: float = 3.0
+    rules_refresh_hours: float = 6.0  # how often exchangeInfo (filters, symbol status) is re-read
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +318,7 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
             "trading_base_url",
             "poll_seconds",
             "max_candle_age_factor",
+            "rules_refresh_hours",
         },
     )
     symbols_raw = m.get("symbols", ["BTCUSDT"])
@@ -342,6 +344,7 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
         trading_base_url=_str(m, "trading_base_url", dm.trading_base_url),
         poll_seconds=_num(m, "poll_seconds", 30.0, 1.0, 3600.0),
         max_candle_age_factor=_num(m, "max_candle_age_factor", 3.0, 1.5, 100.0),
+        rules_refresh_hours=_num(m, "rules_refresh_hours", 6.0, 0.1, 168.0),
     )
     _check_url(market.market_data_base_url, MARKET_DATA_HOSTS, "market.market_data_base_url")
     _check_url(market.trading_base_url, TRADING_HOSTS, "market.trading_base_url")

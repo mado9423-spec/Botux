@@ -185,6 +185,9 @@ class Ledger:
             self.capital_changed_from = Decimal(stored)
         store.kv_set(CAPITAL_KEY, str(capital))
 
+    def update_rules(self, rules: Mapping[str, SymbolRules]) -> None:
+        self._rules.update(rules)
+
     def view(self) -> LedgerView:
         rows = self._store.fill_rows_after(self._epoch)
         return build_ledger(self.capital, rows, self._rules, self._fee)

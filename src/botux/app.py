@@ -92,6 +92,7 @@ def _assemble(
     act_on_current_candle: bool,
     gate_check: Callable[[], None] | None = None,
     lock: InstanceLock | None = None,
+    rules_loader: Callable[[], Mapping[str, SymbolRules]] | None = None,
 ) -> App:
     kill = KillSwitch(settings.paths.kill_file, clock)
     kill.ensure_writable()  # an emergency stop that cannot be written must stop the start-up
@@ -131,6 +132,7 @@ def _assemble(
         paper_broker=paper_broker,
         act_on_current_candle=act_on_current_candle,
         gate_check=gate_check,
+        rules_loader=rules_loader,
     )
     order_manager.set_fill_callback(loop.on_fill)
     return App(loop, store, client, kill, paper_broker, lock)
@@ -153,6 +155,7 @@ def build_paper_app(
     if feed is None:
         client.sync_time()  # measures clock skew using the public /time endpoint
         feed = BinanceMarketFeed(client, settings.market.interval, clock)
+    injected_rules = rules is not None
     rules = dict(rules) if rules is not None else load_rules(client, settings)
     lock: InstanceLock | None = None
     owns_store = store is None
@@ -196,6 +199,8 @@ def build_paper_app(
         paper_broker=paper,
         act_on_current_candle=act_on_current_candle,
         lock=lock,
+        # rules supplied by a caller (tests) are fixed; real ones are re-read from the exchange
+        rules_loader=None if injected_rules else (lambda: load_rules(client, settings)),
     )
 
 
@@ -325,4 +330,5 @@ def build_live_app(
         act_on_current_candle=False,
         gate_check=make_gate_check(settings, kill, clock, client, reload_settings),
         lock=lock,
+        rules_loader=lambda: load_rules(client, settings),
     )

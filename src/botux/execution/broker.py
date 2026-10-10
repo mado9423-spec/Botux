@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Protocol
 
+from botux.exchange.rules import SymbolRules
 from botux.models import Balance, Fill, OrderRequest, OrderResult
 
 
@@ -34,3 +36,7 @@ class Broker(Protocol):
         ...
 
     def balances(self) -> dict[str, Balance]: ...
+
+    def update_rules(self, rules: Mapping[str, SymbolRules]) -> None:
+        """Adopt freshly read exchange rules (filters can change while the bot runs)."""
+        ...

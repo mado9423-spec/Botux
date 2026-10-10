@@ -138,6 +138,9 @@ class PaperBroker:
     def open_orders(self, symbol: str) -> list[OrderResult]:
         return [o for o in self._orders.values() if o.symbol == symbol and not o.status.is_terminal]
 
+    def update_rules(self, rules: Mapping[str, SymbolRules]) -> None:
+        self._rules.update(rules)
+
     def order_fills(self, symbol: str, exchange_order_id: str) -> list[Fill]:
         for o in self._orders.values():
             if o.symbol == symbol and o.exchange_order_id == exchange_order_id:

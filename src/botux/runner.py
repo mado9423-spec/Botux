@@ -18,7 +18,13 @@ from botux.clock import Clock
 from botux.config import SUPPORTED_INTERVALS, Settings
 from botux.data.market import fetch_latest_closed, fetch_quote, validate_live_candles
 from botux.decimals import ZERO
-from botux.errors import ConfigError, ExchangeError, LiveTradingNotAllowed, StorageError
+from botux.errors import (
+    BotuxError,
+    ConfigError,
+    ExchangeError,
+    LiveTradingNotAllowed,
+    StorageError,
+)
 from botux.exchange.client import BinanceSpotClient
 from botux.exchange.rules import SymbolRules
 from botux.execution.broker import Broker
@@ -89,6 +95,7 @@ class TradingLoop:
         paper_broker: PaperBroker | None = None,
         act_on_current_candle: bool = False,
         gate_check: Callable[[], None] | None = None,
+        rules_loader: Callable[[], Mapping[str, SymbolRules]] | None = None,
     ) -> None:
         self._s = settings
         self._feed = feed
@@ -105,6 +112,9 @@ class TradingLoop:
         self._paper = paper_broker
         self._act_current = act_on_current_candle
         self._gate_check = gate_check
+        self._rules_loader = rules_loader
+        self._rules_loaded_at = clock.monotonic()
+        self._rules_next_try = self._rules_loaded_at + settings.market.rules_refresh_hours * 3600
         self._stop_requested = False
         self._kill_handled = False
         self._gate_closed = False
@@ -551,6 +561,55 @@ class TradingLoop:
 
     # ------------------------------------------------------------------ the cycle
 
+    RULES_RETRY_SECONDS = 300.0
+
+    def _maybe_refresh_rules(self) -> None:
+        """Re-read exchangeInfo now and then: filters and symbol status can change under us."""
+        if self._rules_loader is None:
+            return
+        now = self._clock.monotonic()
+        if now < self._rules_next_try:
+            return
+        refresh = self._s.market.rules_refresh_hours * 3600
+        try:
+            new = dict(self._rules_loader())
+        except BotuxError as exc:
+            self._rules_next_try = now + self.RULES_RETRY_SECONDS
+            log.warning("could not refresh exchange rules: %s: %s", type(exc).__name__, exc)
+            if now - self._rules_loaded_at > 2 * refresh:
+                self._block(
+                    "rules-stale",
+                    f"exchange rules could not be refreshed for "
+                    f"{(now - self._rules_loaded_at) / 3600:.1f} h; not entering on stale filters",
+                    alert="Exchange rules are stale",
+                )
+            return
+        self._rules_next_try = now + refresh
+        self._rules_loaded_at = now
+        self._unblock("rules-stale")
+        changed = [sym for sym, r in new.items() if self._rules.get(sym) != r]
+        if changed:
+            self._rules.update(new)
+            self._om.update_rules(new)
+            self._broker.update_rules(new)
+            self._ledger.update_rules(new)
+            self._store.log_event(self._now(), "WARNING", "rules_changed", {"symbols": changed})
+            self._notifier.notify(
+                "WARNING",
+                "Exchange rules changed",
+                f"Filters of {', '.join(changed)} differ from the ones in use; the new ones apply "
+                "from now on (positions that no longer satisfy them may need manual handling).",
+            )
+        for sym, r in self._rules.items():
+            if r.status != "TRADING" or not r.spot_trading_allowed:
+                self._block(
+                    f"symbol-status:{sym}",
+                    f"{sym} is not open for spot trading (status {r.status})",
+                    alert="Symbol not tradable",
+                )
+            else:
+                self._unblock(f"symbol-status:{sym}")
+
     def _health_probe(self, now: int) -> None:
         """The write-ahead log must be writable before any order is considered."""
         try:
@@ -561,6 +620,7 @@ class TradingLoop:
     def _cycle(self) -> None:
         now = self._now()
         self._health_probe(now)
+        self._maybe_refresh_rules()
         self._om.reconcile_pending()
 
         quotes: dict[str, Quote] = {}
