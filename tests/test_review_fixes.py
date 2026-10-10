@@ -38,7 +38,7 @@ from botux.execution.order_manager import LOST_REQUERY_MS, OrderIntent, outcome_
 from botux.execution.paper import FaultKind
 from botux.killswitch import KillSwitch
 from botux.ledger import build_ledger
-from botux.models import Fill, OrderResult, OrderStatus, OrderType, Side
+from botux.models import Fill, OrderResult, OrderStatus, OrderType, Quote, Side
 from botux.safety import ARM_PHRASE, LiveAuthorization, arm_live_interactive
 from botux.secrets_guard import Credentials, Secret
 from botux.storage import OrderRecord, Store
@@ -752,3 +752,130 @@ class TestExpiryReasonIsKept:
         saved = store.get_order("bxr2")
         assert saved is not None and saved.note == "expired: EXECUTION_RULE_PRICE_RANGE_EXCEEDED"
         assert outcome_of(saved) == "not_filled"
+
+
+class TestCancelPathsAndRestarts:
+    """Review: the cancel/restart branches of the order manager had no tests."""
+
+    def order_manager(self, rules: SymbolRules, clock: FakeClock, store: Store, broker):  # type: ignore[no-untyped-def]
+        from botux.alerts import MemoryNotifier
+        from botux.execution.order_manager import OrderManager
+
+        notifier = MemoryNotifier()
+        om = OrderManager(
+            broker, store, {"BTCUSDT": rules}, notifier, clock=clock, reconcile_interval_seconds=0.0
+        )
+        return om, notifier
+
+    def paper(self, rules: SymbolRules, clock: FakeClock):  # type: ignore[no-untyped-def]
+        from botux.execution.paper import PaperBroker
+        from botux.models import Quote
+
+        b = PaperBroker(
+            {"BTCUSDT": rules}, {"USDT": D(100_000)}, fee_rate=D("0.001"), slippage_bps=D(5),
+            clock=clock,
+        )  # fmt: skip
+        b.set_quote(Quote("BTCUSDT", D("60000.00"), D("60000.01"), clock.now_ms()))
+        return b
+
+    def resting(self, key: str) -> OrderIntent:
+        return OrderIntent(
+            key, "BTCUSDT", Side.BUY, OrderType.LIMIT, D("0.01"), D("60000.01"), D("59000.00")
+        )
+
+    def test_a_failing_cancel_is_reported_and_does_not_stop_the_others(
+        self, rules: SymbolRules, clock: FakeClock, store: Store
+    ) -> None:
+        broker = self.paper(rules, clock)
+        om, notifier = self.order_manager(rules, clock, store, broker)
+        om.submit(self.resting("a"))
+        om.submit(self.resting("b"))
+        real_cancel = broker.cancel_order
+        calls: list[str] = []
+
+        def cancel(symbol: str, cid: str):  # type: ignore[no-untyped-def]
+            calls.append(cid)
+            if len(calls) == 1:
+                raise ExchangeError("cancel endpoint down")
+            return real_cancel(symbol, cid)
+
+        broker.cancel_order = cancel
+        assert om.cancel_all_open() == 1  # one failed, one cancelled
+        assert len(calls) == 2
+        assert "Cancel failed" in notifier.titles()
+
+    def test_open_orders_found_in_the_database_after_a_restart_are_tracked_again(
+        self, rules: SymbolRules, clock: FakeClock, store: Store
+    ) -> None:
+        broker = self.paper(rules, clock)
+        om, _ = self.order_manager(rules, clock, store, broker)
+        om.submit(self.resting("a"))
+        rec = store.get_by_intent("a")
+        assert rec is not None and rec.status is OrderStatus.NEW
+        # the process restarts: a new manager, the same database and the same venue
+        om2, _ = self.order_manager(rules, clock, store, broker)
+        assert [o.client_order_id for o in om2.open_orders()] == [rec.client_order_id]
+        broker.set_quote(Quote("BTCUSDT", D("58900.00"), D("58900.01"), clock.now_ms()))
+        om2.reconcile_pending()  # the limit filled while we were away: the record catches up
+        done = store.get_order(rec.client_order_id)
+        assert done is not None and done.status is OrderStatus.FILLED
+        assert len(store.fills_for(rec.client_order_id)) == 1
+        assert om2.open_orders() == []
+
+    def test_a_cancel_whose_first_attempt_succeeded_is_settled_by_a_query(
+        self, rules: SymbolRules, clock: FakeClock, store: Store
+    ) -> None:
+        """DELETE times out (but worked); the retry answers -2011; the order is then queried."""
+        state = {"deletes": 0}
+        ex = FakeExchange()
+
+        def delete(_r: httpx.Request) -> httpx.Response:
+            state["deletes"] += 1
+            if state["deletes"] == 1:
+                return httpx.Response(503, text="gateway timeout")
+            return httpx.Response(400, json={"code": -2011, "msg": "Unknown order sent."})
+
+        canceled = {
+            "symbol": "BTCUSDT", "orderId": 5, "clientOrderId": "bxopen", "price": "59000.00",
+            "origQty": "0.01", "executedQty": "0", "cummulativeQuoteQty": "0",
+            "status": "CANCELED", "type": "LIMIT", "side": "BUY", "updateTime": 1,
+        }  # fmt: skip
+        ex.on("DELETE", "/api/v3/order", delete)
+        ex.on("GET", "/api/v3/order", canceled)
+        ex.on("GET", "/api/v3/time", {"serverTime": clock.now_ms()})
+        client = BinanceSpotClient(
+            credentials=Credentials(Secret(API_KEY), Secret(API_SECRET)),
+            trading_enabled=True,
+            http=ex.http(),
+            clock=clock,
+        )
+        broker = LiveBroker(client, {"BTCUSDT": rules}, LiveAuthorization("f", 0))
+        om, _ = self.order_manager(rules, clock, store, broker)
+        rec = OrderRecord(
+            "bxopen", "kopen", "BTCUSDT", Side.BUY, OrderType.LIMIT, D("0.01"), D("59000"),
+            OrderStatus.NEW, 1, 1,
+        )  # fmt: skip
+        store.insert_order(rec)
+        assert om.cancel_all_open() == 0  # the venue says "not open" ...
+        got = store.get_order("bxopen")
+        assert got is not None and got.status is OrderStatus.CANCELED  # ... and a query settles it
+        assert state["deletes"] == 2  # retried once (cancels are idempotent), never more
+
+    def test_an_unresolved_sell_keeps_the_stop_loss_from_selling_twice(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        patient = dataclasses.replace(
+            cfg, execution=ExecutionSettings(reconcile_attempts=5, reconcile_interval_seconds=0.0)
+        )
+        h = harness(patient, rules, store)
+        enter_long(h)
+        h.paper.faults.push(FaultKind.TIMEOUT_NOT_EXECUTED)
+        h.feed.bid, h.feed.ask = D("90.00"), D("90.01")
+        h.loop.run_cycle()
+        (sell,) = sells(h)
+        assert sell.status in (OrderStatus.UNKNOWN, OrderStatus.PENDING_SEND)
+        placed = h.paper.placed_count
+        h.clock.advance(61)  # a new stop-loss minute while the first SELL is unresolved
+        h.paper.fill_plan.push("0")  # (would be visible if a second SELL were sent)
+        h.loop.run_cycle()
+        assert h.paper.placed_count == placed  # no second SELL while the first is unresolved
