@@ -22,7 +22,7 @@ the configured fee rate as an estimate and widen the tolerance accordingly.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 from botux.decimals import ZERO
@@ -48,6 +48,7 @@ class SymbolLedger:
 class LedgerView:
     capital: Decimal
     symbols: Mapping[str, SymbolLedger]
+    average_cost: Mapping[str, Decimal] = field(default_factory=dict)  # of what is still held
 
     @property
     def cash(self) -> Decimal:
@@ -74,11 +75,20 @@ def build_ledger(
 ) -> LedgerView:
     """Fold fills into per-symbol positions and the bot's cash."""
     acc = {sym: _Acc() for sym in rules}
+    held: dict[str, list[Decimal]] = {sym: [ZERO, ZERO] for sym in rules}  # [qty, cost]
     for symbol, side, fill in rows:
         r = rules.get(symbol)
         if r is None:
             continue
         a = acc[symbol]
+        h = held[symbol]
+        if side is Side.BUY:
+            h[0] += fill.quantity
+            h[1] += fill.price * fill.quantity
+        elif h[0] > 0:  # a sale removes cost at the running average
+            take = min(fill.quantity, h[0])
+            h[1] -= h[1] / h[0] * take
+            h[0] -= take
         notional = fill.price * fill.quantity
         asset = fill.commission_asset
         base_in = fill.quantity if side is Side.BUY else ZERO
@@ -107,7 +117,7 @@ def build_ledger(
         a.flow += quote_in - quote_out
     return LedgerView(
         capital,
-        {
+        symbols={
             sym: SymbolLedger(
                 sym,
                 base_qty=a.base,
@@ -117,6 +127,7 @@ def build_ledger(
             )
             for sym, a in acc.items()
         },
+        average_cost={sym: h[1] / h[0] for sym, h in held.items() if h[0] > 0},
     )
 
 

@@ -62,6 +62,26 @@ MARKET_DATA_HOSTS = frozenset(
     }
 )
 TRADING_HOSTS = MARKET_DATA_HOSTS - {"data-api.binance.vision"}
+TESTNET_HOSTS = frozenset({"testnet.binance.vision"})
+
+
+def environment_of(host: str | None) -> str:
+    """'testnet' or 'mainnet'. Market data and trading must come from the SAME environment:
+    prices from one and orders to the other would size real orders from the wrong prices."""
+    return "testnet" if host in TESTNET_HOSTS else "mainnet"
+
+
+def check_same_environment(market_data_url: str, trading_url: str) -> None:
+    a, b = (
+        environment_of(urlparse(market_data_url).hostname),
+        environment_of(urlparse(trading_url).hostname),
+    )
+    if a != b:
+        raise ConfigError(
+            f"market-data host is on {a} but the trading host is on {b}: both must belong to the "
+            "same Binance environment (never size real orders from testnet prices or vice versa)"
+        )
+
 
 _SYMBOL_RE = re.compile(r"[A-Z0-9]{5,20}")  # always used with fullmatch()
 _ASSET_RE = re.compile(r"[A-Z0-9]{2,10}")
@@ -325,6 +345,7 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
     )
     _check_url(market.market_data_base_url, MARKET_DATA_HOSTS, "market.market_data_base_url")
     _check_url(market.trading_base_url, TRADING_HOSTS, "market.trading_base_url")
+    check_same_environment(market.market_data_base_url, market.trading_base_url)
     if market.poll_seconds < 1:
         raise ConfigError("market.poll_seconds must be >= 1 (be polite to the API)")
     if market.max_candle_age_factor < 1.5:

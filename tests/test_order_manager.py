@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from decimal import Decimal
 from pathlib import Path
@@ -263,12 +264,18 @@ class TestCrashRecovery:
 
 
 class TestKillSwitchInteraction:
-    def test_entries_are_blocked_but_exits_are_allowed(self, env: Env) -> None:
+    def test_once_killed_only_a_flatten_order_may_still_go_out(self, env: Env) -> None:
         env.om.submit(buy("e0"))
         env.kill.trip("test")
         assert env.om.submit(buy("e1")).outcome == "blocked"
         qty = env.rules.round_qty(env.broker.balances()["BTC"].free)
-        assert env.om.submit(sell("x1", str(qty))).outcome == "accepted"
+        # an ordinary exit (stop-loss, strategy exit) is NOT sent any more: the stop means stop
+        blocked = env.om.submit(sell("x1", str(qty)))
+        assert blocked.outcome == "blocked" and "kill switch" in blocked.reason
+        assert env.broker.placed_count == 1
+        # the flatten policy (flatten_on_kill = true) is the one explicit exception
+        flatten = dataclasses.replace(sell("x2", str(qty)), flatten=True)
+        assert env.om.submit(flatten).outcome == "accepted"
 
     def test_cancel_all_open_orders(self, env: Env) -> None:
         limit = OrderIntent(

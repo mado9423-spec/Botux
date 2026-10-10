@@ -107,7 +107,7 @@ class TestEntryGuardBeforeEveryNewOrder:
             hours=1
         )  # the BUY signal: call 1 = cycle start (open), call 2 = just before the order
         assert buys(h) == [] and h.paper.placed_count == 0
-        assert "arming file removed" in (h.loop.risk.hard_halt_reason or "")
+        assert "arming file removed" in h.loop.risk.blockers["live-gate"]
         assert "Live gate closed" in h.notifier.titles()
 
     def test_an_open_gate_lets_the_entry_through(

@@ -34,7 +34,7 @@ class FeedStub:
 
 def halt_reason(app: App) -> str | None:
     """Indirection so the type checker does not narrow the property across method calls."""
-    return app.loop.risk.hard_halt_reason
+    return app.loop.risk.blockers.get("live-gate")
 
 
 def unresolved(store: Store) -> None:

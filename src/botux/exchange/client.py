@@ -11,8 +11,12 @@ Safety properties (each one has a test):
   ``trading_enabled=True``, which only the guarded live path sets.
 * Public data goes to the market-data host; signed requests only go to an allow-listed trading
   host, so a typo cannot send the API key somewhere else.
-* State-changing requests are NEVER retried here. A timeout, a 5XX, or error codes -1000/-1001/
-  -1006/-1007/-1008 raise :class:`OutcomeUnknownError` (the order may have been executed).
+* Order-creating requests (``new_order``, ``test_order``) are NEVER retried here. A timeout, a 5XX,
+  or error codes -1000/-1001/-1006/-1007/-1008 raise :class:`OutcomeUnknownError` (the order may
+  have been executed). Cancels and reads ARE retried (they are idempotent); a cancel whose first
+  attempt succeeded answers -2011 on the retry, which the live broker reports as "not open" and
+  the order manager then settles by querying the order.
+* A client that carries an API key ignores proxy / CA environment variables (``trust_env=False``).
 * HTTP 429/418 start a local cool-down honouring ``Retry-After``; nothing is sent during it.
 * HTTP 451 (restricted location) is reported as is. It is never worked around.
 * Nothing sensitive is logged: only method, path, status and latency.
@@ -35,7 +39,7 @@ from urllib.parse import urlencode
 import httpx
 
 from botux.clock import Clock, SystemClock
-from botux.config import MARKET_DATA_HOSTS, TRADING_HOSTS
+from botux.config import MARKET_DATA_HOSTS, TRADING_HOSTS, check_same_environment
 from botux.decimals import fmt
 from botux.errors import (
     APIError,
@@ -104,6 +108,7 @@ ENDPOINTS: dict[str, Endpoint] = dict(
         _ep("account", "GET", "/api/v3/account", Security.USER_DATA, 20, retry=True),
         _ep("get_order", "GET", "/api/v3/order", Security.USER_DATA, 4, retry=True),
         _ep("open_orders", "GET", "/api/v3/openOrders", Security.USER_DATA, 6, retry=True),
+        _ep("my_trades", "GET", "/api/v3/myTrades", Security.USER_DATA, 5, retry=True),
         _ep(
             "api_restrictions",
             "GET",
@@ -188,6 +193,7 @@ class BinanceSpotClient:
             host = httpx.URL(url).host
             if not url.startswith("https://") or host not in allowed:
                 raise ConfigError(f"{what} base URL {url!r} is not an allow-listed https host")
+        check_same_environment(market_data_base_url, trading_base_url)
         if recv_window_ms > 5000 or recv_window_ms < 500:
             raise ConfigError("recv_window_ms must be within [500, 5000] (Binance advises <= 5000)")
         if (trading_enabled or order_test_enabled) and credentials is None:
@@ -197,9 +203,14 @@ class BinanceSpotClient:
         self._credentials = credentials
         self._trading_enabled = trading_enabled
         self._order_test_enabled = order_test_enabled
+        # A client that carries an API key ignores proxy / CA environment variables
+        # (HTTPS_PROXY, SSL_CERT_FILE...): a forgotten variable must not be able to route signed
+        # requests through a third party. Public market-data clients keep the usual behaviour.
         self._http = http or httpx.Client(
             timeout=httpx.Timeout(15.0, connect=5.0),
             follow_redirects=False,
+            trust_env=credentials is None,
+            verify=True,
             headers={"User-Agent": "botux/0.1 (+educational)"},
         )
         self._clock = clock or SystemClock()
@@ -494,6 +505,10 @@ class BinanceSpotClient:
 
     def open_orders(self, symbol: str) -> list[dict[str, Any]]:
         return list(self._call("open_orders", {"symbol": symbol}))
+
+    def my_trades(self, symbol: str, order_id: int) -> list[dict[str, Any]]:
+        """GET /api/v3/myTrades for ONE order (weight 5): the real per-trade fills."""
+        return list(self._call("my_trades", {"symbol": symbol, "orderId": order_id}))
 
     # ------------------------------------------------------------------ trading (guarded)
 

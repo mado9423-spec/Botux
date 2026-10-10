@@ -267,7 +267,9 @@ class TradingLoop:
             self._gate_check()
         except LiveTradingNotAllowed as exc:
             self._gate_closed = True
-            self._risk.halt(f"live gate closed: {exc}")
+            # a blocker, NOT a persisted halt: after the operator re-arms and restarts, the gate
+            # is evaluated afresh instead of an old verdict being restored from the database
+            self._block("live-gate", f"live gate closed: {exc}")
             self._notifier.notify(
                 "CRITICAL",
                 "Live gate closed",
@@ -278,8 +280,6 @@ class TradingLoop:
     def _entry_guard(self, intent: OrderIntent) -> str | None:
         """Last-moment veto for any NEW order: gate and risk state are looked at again NOW."""
         self._check_gate()
-        if self._gate_closed:
-            return self._risk.hard_halt_reason or "live gate closed"
         ok, why = self._risk.entries_allowed()
         return None if ok else why
 
@@ -298,9 +298,23 @@ class TradingLoop:
                 self._clock.now_ms(), "CRITICAL", "kill_switch", {"reason": reason}
             )
             try:
+                self._om.reconcile_pending()  # learn what happened to anything in flight
+            except Exception:
+                log.exception("could not reconcile orders during emergency stop")
+            try:
                 self._om.cancel_all_open()
             except Exception:
                 log.exception("could not cancel open orders during emergency stop")
+            unresolved = self._om.uncertain_orders()
+            if unresolved:
+                ids = ", ".join(o.client_order_id for o in unresolved)
+                self._notifier.notify(
+                    "CRITICAL",
+                    "Orders with unknown outcome at emergency stop",
+                    f"{len(unresolved)} order(s) could not be resolved ({ids}) and the bot is "
+                    "stopping: check the exchange by hand; a position may exist that nothing "
+                    "manages.",
+                )
             if self._s.risk.flatten_on_kill:
                 for sym in self._s.market.symbols:
                     try:
@@ -334,6 +348,7 @@ class TradingLoop:
                 quantity=qty,
                 reference_price=quote.bid,
                 is_exit=True,
+                flatten=True,
             )
         )
         if result.outcome != "accepted":
@@ -577,6 +592,8 @@ class TradingLoop:
         #    kline feed cannot disable the stop-loss. One failing symbol must not starve others.
         acted = False
         for sym in self._s.market.symbols:
+            if self._kill.is_set():
+                return  # the next run_cycle performs the emergency-stop policy
             try:
                 acted |= self._protect(sym, quotes[sym], view)
             except Exception as exc:
@@ -587,6 +604,8 @@ class TradingLoop:
 
         # 2) Signals, which do need validated candles.
         for sym in self._s.market.symbols:
+            if self._kill.is_set():
+                return
             try:
                 candles = self._feed.closed_candles(sym, self._strategy.warmup + 2)
                 validate_live_candles(
@@ -632,14 +651,18 @@ class TradingLoop:
             return False
         info = self._positions.get(sym)
         if info is None:
-            # e.g. after a crash between the fill and its bookkeeping: protect from NOW on.
-            self._positions.on_buy(sym, ZERO, held, quote.mid)
+            # e.g. after a crash between the fill and its bookkeeping. The bot's own fills still
+            # say what the position cost, so the stop is re-armed from that, not from today's
+            # price (which could be far below the real entry).
+            cost = self._ledger.view().average_cost.get(sym)
+            basis = cost if cost is not None and cost > 0 else quote.mid
+            self._positions.on_buy(sym, ZERO, held, basis)
             info = self._positions.get(sym)
             self._notifier.notify(
                 "WARNING",
                 "Stop-loss re-armed",
-                f"{sym}: position {held} had no recorded entry; stop re-armed from the current "
-                f"price {quote.mid}.",
+                f"{sym}: position {held} had no recorded entry; stop re-armed from "
+                f"{'its average cost' if basis != quote.mid else 'the current price'} {basis:f}.",
             )
         if info is not None and quote.bid <= info.stop_price:
             log.warning("%s stop-loss: bid %s <= stop %s", sym, quote.bid, info.stop_price)
@@ -763,7 +786,7 @@ class TradingLoop:
             )
         )
         log.info("%s SELL %s (%s) -> %s %s", sym, held, why, result.outcome, result.reason)
-        if result.outcome not in ("accepted", "duplicate"):
+        if result.outcome not in ("accepted", "duplicate") and not self._kill.is_set():
             self._alert_throttled(
                 f"exit-fail:{sym}",
                 "CRITICAL",

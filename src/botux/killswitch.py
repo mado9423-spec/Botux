@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 from botux.clock import Clock, SystemClock
+from botux.errors import ConfigError
 
 log = logging.getLogger(__name__)
 
@@ -47,8 +48,30 @@ class KillSwitch:
             return str(data.get("reason", "kill file present"))
         return "kill file present"  # e.g. `echo 1 > KILL`: any content still means STOP
 
-    def trip(self, reason: str) -> None:
-        """Set the switch. The in-memory flag is set even if the file cannot be written."""
+    def ensure_writable(self) -> None:
+        """Prove now that ``botux kill`` will be able to create the file (raises ConfigError).
+
+        An emergency stop that cannot be written is worse than none: the operator believes it
+        worked while the running bot never sees it.
+        """
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self._path.parent, prefix=".kill-probe-")
+            os.close(fd)
+            os.unlink(tmp)
+        except OSError as exc:
+            raise ConfigError(
+                f"the kill-switch location {self._path} is not writable ({type(exc).__name__}); "
+                "the emergency stop could not work. Fix paths.kill_file first"
+            ) from None
+        if self._path.is_dir():
+            raise ConfigError(f"the kill-switch path {self._path} is a directory")
+
+    def trip(self, reason: str) -> bool:
+        """Set the switch. The in-memory flag is set even if the file cannot be written.
+
+        Returns True when the kill FILE (which other processes can see) now exists.
+        """
         self._tripped = True
         self._reason = reason
         log.critical("KILL SWITCH TRIPPED: %s", reason)
@@ -60,6 +83,7 @@ class KillSwitch:
             os.replace(tmp, self._path)
         except OSError:
             log.exception("could not write kill file %s (in-memory flag is still set)", self._path)
+        return self._path.is_file()
 
     def clear(self) -> None:
         """Remove the kill file and reset the flag. Only a human-invoked command calls this."""

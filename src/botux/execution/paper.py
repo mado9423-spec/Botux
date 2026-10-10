@@ -138,6 +138,12 @@ class PaperBroker:
     def open_orders(self, symbol: str) -> list[OrderResult]:
         return [o for o in self._orders.values() if o.symbol == symbol and not o.status.is_terminal]
 
+    def order_fills(self, symbol: str, exchange_order_id: str) -> list[Fill]:
+        for o in self._orders.values():
+            if o.symbol == symbol and o.exchange_order_id == exchange_order_id:
+                return list(o.fills)
+        return []
+
     def balances(self) -> dict[str, Balance]:
         assets = set(self._free) | set(self._locked)
         return {a: Balance(self._free.get(a, ZERO), self._locked.get(a, ZERO)) for a in assets}

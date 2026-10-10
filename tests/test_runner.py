@@ -648,7 +648,7 @@ class TestLiveGateWhileRunning:
 
         h.loop._gate_check = closed
         h.loop.run_cycle()
-        assert h.loop.risk.hard_halt_reason and "arming expired" in h.loop.risk.hard_halt_reason
+        assert "arming expired" in h.loop.risk.blockers["live-gate"]
         assert "Live gate closed" in h.notifier.titles()
         # entries are impossible now ...
         assert h.loop.risk.size_entry(rules, D(100), _view()).quantity == 0

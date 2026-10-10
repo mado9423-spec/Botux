@@ -187,7 +187,7 @@ class TestOrderManagerWithPartialFills:
     def test_a_partial_market_buy_is_recorded_once_and_the_books_agree(self, env: Env) -> None:
         env.paper.fill_plan.push("0.4")
         res = env.om.submit(market("k1", Side.BUY, "0.01"))
-        assert res.outcome == "accepted"
+        assert res.outcome == "partial"  # the caller is told it was NOT fully done
         rec = env.record("k1")
         assert rec.status is OrderStatus.EXPIRED and rec.executed_qty == D("0.004")
         assert len(env.fills) == 1 and env.fills[0][1][0].quantity == D("0.004")
@@ -262,7 +262,7 @@ class TestOrderManagerWithPartialFills:
         env.paper.fill_plan.push("0.5")
         res = env.om.submit(market("k6", Side.BUY, "0.002"))
         rec = env.record("k6")
-        assert res.outcome == "accepted"  # reconciled straight away
+        assert res.outcome == "partial"  # reconciled straight away: the venue ended it half-done
         assert rec.status is OrderStatus.EXPIRED and rec.executed_qty == D("0.001")
         assert env.paper.placed_count == 1  # never sent a second time
         assert len(env.store.fills_for(rec.client_order_id)) == 1

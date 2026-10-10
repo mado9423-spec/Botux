@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from botux.models import Balance, OrderRequest, OrderResult
+from botux.models import Balance, Fill, OrderRequest, OrderResult
 
 
 class Broker(Protocol):
@@ -28,5 +28,9 @@ class Broker(Protocol):
         ...
 
     def open_orders(self, symbol: str) -> list[OrderResult]: ...
+
+    def order_fills(self, symbol: str, exchange_order_id: str) -> list[Fill]:
+        """Per-trade fills (price, quantity, REAL commission) of one order; [] when unknown."""
+        ...
 
     def balances(self) -> dict[str, Balance]: ...

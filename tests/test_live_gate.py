@@ -97,7 +97,7 @@ def live_exchange(clock: FakeClock, restrictions: dict[str, object] | None = Non
         dict(GOOD_KEY if restrictions is None else restrictions),
     )
     ex.on("GET", "/api/v3/exchangeInfo", EXCHANGE_INFO_BTCUSDT)
-    ex.on("GET", "/api/v3/account", {"canTrade": True, "balances": []})
+    ex.on("GET", "/api/v3/account", {"canTrade": True, "uid": 4242, "balances": []})
 
     def new_order(req: httpx.Request) -> httpx.Response:
         body = parse_qs(req.content.decode())

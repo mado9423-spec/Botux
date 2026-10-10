@@ -94,6 +94,7 @@ def _assemble(
     lock: InstanceLock | None = None,
 ) -> App:
     kill = KillSwitch(settings.paths.kill_file, clock)
+    kill.ensure_writable()  # an emergency stop that cannot be written must stop the start-up
     notifier = CompositeNotifier(LogNotifier(), FileNotifier(settings.paths.alerts_file, clock))
     risk = RiskManager(
         settings.risk,
@@ -199,6 +200,8 @@ def build_paper_app(
 
 
 KEY_RECHECK_SECONDS = 3600.0
+KEY_RETRY_SECONDS = 60.0
+KEY_MAX_LOOKUP_FAILURES = 10
 
 
 def make_gate_check(
@@ -208,14 +211,19 @@ def make_gate_check(
     client: BinanceSpotClient,
     reload_settings: Callable[[], Settings] | None = None,
 ) -> Callable[[], None]:
-    """Re-verify the live gate while running: arming file and settings on disk (cheap, every
-    call) and the API key's permissions (network, at most hourly; a failed lookup is logged and
-    retried later)."""
-    last_key_check = clock.monotonic()
+    """Re-verify the live gate while running.
+
+    Every call: the settings file on disk, the arming file, the kill switch (cheap, local). The
+    API key's permissions are looked up over the network about hourly; a failed lookup is retried
+    after a minute, and after too many failures in a row the gate CLOSES (an unverifiable key is
+    not a verified one).
+    """
+    next_key_check = clock.monotonic() + KEY_RECHECK_SECONDS
+    failures = 0
     running = settings_fingerprint(settings)
 
     def check() -> None:
-        nonlocal last_key_check
+        nonlocal next_key_check, failures
         if reload_settings is not None:
             try:
                 on_disk = reload_settings()
@@ -227,19 +235,43 @@ def make_gate_check(
                     "to apply them"
                 )
         check_live_gate(settings, kill, clock.now_ms())
-        if clock.monotonic() - last_key_check < KEY_RECHECK_SECONDS:
+        if clock.monotonic() < next_key_check:
             return
-        last_key_check = clock.monotonic()
         try:
             info = client.api_restrictions()
         except ExchangeError as exc:
-            log.warning("could not re-check API key permissions: %s", exc)
+            failures += 1
+            next_key_check = clock.monotonic() + KEY_RETRY_SECONDS
+            log.warning("could not re-check API key permissions (%d): %s", failures, exc)
+            if failures >= KEY_MAX_LOOKUP_FAILURES:
+                raise LiveTradingNotAllowed(
+                    f"the API key's permissions could not be verified {failures} times in a row"
+                ) from None
             return
+        failures = 0
+        next_key_check = clock.monotonic() + KEY_RECHECK_SECONDS
         problems = api_key_problems(info, settings.live.require_ip_restriction)
         if problems:
             raise LiveTradingNotAllowed("API key permissions changed: " + "; ".join(problems))
 
     return check
+
+
+def bind_account(store: Store, uid: str | None) -> None:
+    """A live database belongs to ONE Binance account; a different key pointing at another
+    account must not inherit this database's baselines, ledger and positions."""
+    if not uid:
+        raise LiveTradingNotAllowed(
+            "the account answer carries no uid, so this database cannot be bound to the account"
+        )
+    bound = store.kv_get("account_uid")
+    if not bound:
+        store.kv_set("account_uid", uid)
+    elif bound != uid:
+        raise LiveTradingNotAllowed(
+            "this database was created for a different Binance account; use a separate database "
+            "(paths.database) for each account"
+        )
 
 
 def build_live_app(
@@ -273,7 +305,8 @@ def build_live_app(
         store = Store(db)
     try:
         store.claim_mode("live")
-    except ConfigError:
+        bind_account(store, getattr(broker, "account_uid", None))
+    except (ConfigError, LiveTradingNotAllowed):
         client.close()
         if owns_store:
             store.close()

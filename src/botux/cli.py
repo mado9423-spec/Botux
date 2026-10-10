@@ -234,7 +234,12 @@ def _print_summary(app: App, s: Settings) -> None:
 
 def cmd_kill(args: argparse.Namespace) -> int:
     s = _settings(args)
-    KillSwitch(s.paths.kill_file).trip(args.reason)
+    if not KillSwitch(s.paths.kill_file).trip(args.reason):
+        raise BotuxError(
+            f"the kill file {s.paths.kill_file} could NOT be written, so a running bot will not "
+            "see this stop. Stop the process by other means (Ctrl+C / SIGTERM) and fix "
+            "paths.kill_file"
+        )
     print(
         f"kill switch SET: {s.paths.kill_file}\n"
         "A bot using this same file cancels open orders and stops. Make sure it was started with "
@@ -297,7 +302,11 @@ def cmd_arm_live(args: argparse.Namespace) -> int:
 
 def cmd_disarm_live(args: argparse.Namespace) -> int:
     disarm(_settings(args))
-    print("live trading disarmed.")
+    print(
+        "live trading disarmed: a bot that is already running stops NEW entries on its next look "
+        "but still manages exits (stop-loss / strategy exit) for positions it holds. To stop "
+        "everything use 'botux kill'."
+    )
     return 0
 
 

@@ -110,6 +110,7 @@ class LiveBroker:
             raise LiveTradingNotAllowed("client was not created with trading enabled")
         self._client = client
         self._rules = dict(rules)
+        self.account_uid: str | None = None  # set by build_live_broker from GET /api/v3/account
 
     def place_order(self, request: OrderRequest) -> OrderResult:
         rules = self._rules.get(request.symbol)
@@ -167,6 +168,22 @@ class LiveBroker:
         except _PARSE_ERRORS as exc:
             raise ExchangeError(f"unreadable open-orders answer ({type(exc).__name__})") from None
 
+    def order_fills(self, symbol: str, exchange_order_id: str) -> list[Fill]:
+        try:
+            trades = self._client.my_trades(symbol, int(exchange_order_id))
+            ordered = sorted(trades, key=lambda t: int(t["id"]))
+            return [
+                Fill(
+                    D(t["price"]),
+                    D(t["qty"]),
+                    D(t["commission"]),
+                    str(t["commissionAsset"]),
+                )
+                for t in ordered
+            ]
+        except (*_PARSE_ERRORS, ValueError) as exc:
+            raise ExchangeError(f"unreadable trades answer ({type(exc).__name__})") from None
+
     def balances(self) -> dict[str, Balance]:
         out: dict[str, Balance] = {}
         for b in self._client.account().get("balances", []):
@@ -206,7 +223,8 @@ def build_live_broker(
     if problems:
         client.close()
         raise LiveTradingNotAllowed("API key refused: " + "; ".join(problems))
-    if client.account().get("canTrade") is not True:
+    account = client.account()
+    if account.get("canTrade") is not True:
         client.close()
         raise LiveTradingNotAllowed("the account reports canTrade != true; refusing to start")
     rules = {
@@ -214,7 +232,10 @@ def build_live_broker(
         for sym in settings.market.symbols
     }
     log.warning("LIVE TRADING AUTHORISED for %s", ", ".join(settings.market.symbols))
-    return LiveBroker(client, rules, auth), client
+    broker = LiveBroker(client, rules, auth)
+    raw_uid = account.get("uid")
+    broker.account_uid = None if raw_uid is None else str(raw_uid)
+    return broker, client
 
 
 def total_balance(balances: Mapping[str, Balance], asset: str) -> Decimal:

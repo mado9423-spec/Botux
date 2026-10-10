@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -119,6 +120,7 @@ class InstanceLock:
 class Store:
     def __init__(self, path: str | Path = ":memory:") -> None:
         self._path = str(path)
+        self._depth = 0
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self._path)
@@ -131,6 +133,28 @@ class Store:
 
     def close(self) -> None:
         self._conn.close()
+
+    @contextmanager
+    def _write(self) -> Iterator[None]:
+        """One commit per write, unless an enclosing :meth:`transaction` groups several."""
+        if self._depth:
+            yield
+            return
+        with self._conn:
+            yield
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Make several writes atomic: all are committed together or none is (single thread)."""
+        if self._depth:  # already inside one: join it
+            yield
+            return
+        self._depth += 1
+        try:
+            with self._conn:
+                yield
+        finally:
+            self._depth -= 1
 
     def integrity_ok(self) -> bool:
         """SQLite's own quick consistency check ("ok" when the file is sound)."""
@@ -159,7 +183,7 @@ class Store:
     def insert_order(self, rec: OrderRecord) -> bool:
         """Insert; returns False (and changes nothing) if the intent key already exists."""
         try:
-            with self._conn:
+            with self._write():
                 self._conn.execute(
                     "INSERT INTO orders (client_order_id, intent_key, symbol, side, type, quantity,"
                     " price, status, exchange_order_id, executed_qty, cumulative_quote_qty,"
@@ -189,7 +213,7 @@ class Store:
 
     def delete_unsent_order(self, client_order_id: str) -> bool:
         """Delete a PENDING_SEND row that provably never reached the venue (only those)."""
-        with self._conn:
+        with self._write():
             cur = self._conn.execute(
                 "DELETE FROM orders WHERE client_order_id=? AND status=?",
                 (client_order_id, OrderStatus.PENDING_SEND.value),
@@ -197,7 +221,7 @@ class Store:
         return cur.rowcount == 1
 
     def update_order(self, rec: OrderRecord) -> None:
-        with self._conn:
+        with self._write():
             self._conn.execute(
                 "UPDATE orders SET status=?, exchange_order_id=?, executed_qty=?,"
                 " cumulative_quote_qty=?, updated_ms=?, reconcile_attempts=?, note=?"
@@ -268,15 +292,15 @@ class Store:
 
     def count_orders_since(self, since_ms: int) -> int:
         row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM orders WHERE created_ms>=? AND status NOT IN (?, ?)",
-            (since_ms, OrderStatus.REJECTED.value, OrderStatus.LOST.value),
+            "SELECT COUNT(*) AS n FROM orders WHERE created_ms>=? AND status<>?",
+            (since_ms, OrderStatus.REJECTED.value),  # a LOST order may well have executed
         ).fetchone()
         return int(row["n"])
 
     # ------------------------------------------------------------------ fills
 
     def add_fills(self, client_order_id: str, fills: Iterable[Fill], ts_ms: int) -> None:
-        with self._conn:
+        with self._write():
             self._conn.executemany(
                 "INSERT INTO fills (client_order_id, price, quantity, commission, commission_asset,"
                 " ts_ms) VALUES (?,?,?,?,?,?)",
@@ -328,7 +352,7 @@ class Store:
     def log_event(self, ts_ms: int, level: str, kind: str, detail: dict[str, Any] | str) -> None:
         raw = detail if isinstance(detail, str) else json.dumps(detail, default=str, sort_keys=True)
         text = GLOBAL_REDACTOR.scrub(raw)
-        with self._conn:
+        with self._write():
             self._conn.execute(
                 "INSERT INTO events (ts_ms, level, kind, detail) VALUES (?,?,?,?)",
                 (ts_ms, level, kind, text),
@@ -346,7 +370,7 @@ class Store:
         return None if row is None else str(row["value"])
 
     def kv_set(self, key: str, value: str) -> None:
-        with self._conn:
+        with self._write():
             self._conn.execute(
                 "INSERT INTO kv (key, value) VALUES (?, ?)"
                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -354,7 +378,7 @@ class Store:
             )
 
     def kv_clear_prefix(self, prefix: str) -> None:
-        with self._conn:
+        with self._write():
             self._conn.execute(
                 "DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'",
                 (prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
@@ -363,7 +387,7 @@ class Store:
     def expire_stale_orders(self, now_ms: int, note: str) -> int:
         """Mark every non-terminal order EXPIRED (used when a paper session starts fresh)."""
         terminal = [s.value for s in OrderStatus if s.is_terminal]
-        with self._conn:
+        with self._write():
             placeholders = ",".join("?" * len(terminal))  # only "?" characters, values are bound
             cur = self._conn.execute(
                 f"UPDATE orders SET status=?, note=?, updated_ms=? "  # noqa: S608
@@ -373,7 +397,7 @@ class Store:
         return cur.rowcount
 
     def add_equity(self, ts_ms: int, equity: Decimal, cash: Decimal) -> None:
-        with self._conn:
+        with self._write():
             self._conn.execute(
                 "INSERT INTO equity (ts_ms, equity, cash) VALUES (?,?,?)",
                 (ts_ms, str(equity), str(cash)),

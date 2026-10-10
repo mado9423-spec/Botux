@@ -58,13 +58,33 @@ class OrderIntent:
     reference_price: Decimal
     price: Decimal | None = None
     is_exit: bool = False  # exits stay possible during a daily-loss halt / flatten
+    flatten: bool = False  # the one kind of order still allowed once the kill switch is set
 
 
 @dataclass(frozen=True, slots=True)
 class SubmitResult:
-    outcome: str  # accepted | duplicate | blocked | rejected | uncertain
+    # accepted   - placed and not (yet) known to have failed (filled, or resting on the book)
+    # not_filled - the venue answered but executed nothing (REJECTED/EXPIRED/CANCELED, 0 filled)
+    # partial    - the venue answered, executed only part of it and ended the order
+    # duplicate | blocked | rejected | retry_later | uncertain (outcome unknown: reconcile)
+    outcome: str
     record: OrderRecord | None = None
     reason: str = ""
+
+
+def outcome_of(record: OrderRecord) -> str:
+    """How an order that the venue has answered about should be reported to the caller."""
+    if record.status in UNCERTAIN_STATUSES or record.status is OrderStatus.LOST:
+        return "uncertain"
+    if record.status in (OrderStatus.REJECTED, OrderStatus.EXPIRED, OrderStatus.CANCELED):
+        if record.executed_qty <= 0:
+            return "not_filled"
+        if record.executed_qty < record.quantity:
+            return "partial"
+    return "accepted"
+
+
+LOST_REQUERY_MS = 300_000  # how often an order we gave up on is looked up again
 
 
 def client_order_id_for(intent_key: str) -> str:
@@ -114,21 +134,35 @@ class OrderManager:
     def open_orders(self, symbol: str | None = None) -> list[OrderRecord]:
         return self._store.list_orders(OPEN_STATUSES, symbol)
 
+    def lost_orders(self, symbol: str) -> list[OrderRecord]:
+        """Orders given up on and not yet resolved by a human (or found again by a re-query)."""
+        if not self._store.kv_get(f"lost:{symbol}"):
+            return []
+        return self._store.list_orders((OrderStatus.LOST,), symbol)
+
     def is_symbol_blocked(self, symbol: str, *, for_exit: bool = False) -> str | None:
         """Reason string when no new order may be sent for ``symbol``, else None.
 
         Entries are blocked while ANY order on the symbol is unresolved or was LOST. Exits are
-        blocked only while an unresolved SELL exists (to avoid selling twice): an unresolved BUY
-        must never stop a stop-loss, because sells are sized from the real balance.
+        blocked only while a SELL is unresolved or LOST (to avoid selling twice, possibly coins
+        that are not the bot's): an unresolved BUY must never stop a stop-loss, because sells
+        are sized from the bot's own holdings.
         """
         uncertain = self.uncertain_orders(symbol)
+        lost = self.lost_orders(symbol)
         if for_exit:
             if any(o.side is Side.SELL for o in uncertain):
                 return f"unresolved SELL on {symbol}: reconciling first"
+            if any(o.side is Side.SELL for o in lost):
+                return (
+                    f"a SELL on {symbol} was LOST (outcome unknown): the position may still be "
+                    "open or already sold. Check the exchange, close it by hand if needed, then "
+                    "run 'botux resolve-lost'"
+                )
             return None
         if uncertain:
             return f"unresolved order(s) on {symbol}: reconciling first"
-        if self._store.kv_get(f"lost:{symbol}"):
+        if lost:
             return (
                 f"an order on {symbol} was LOST; verify on the exchange then run "
                 "'botux resolve-lost'"
@@ -144,7 +178,7 @@ class OrderManager:
 
     def submit(self, intent: OrderIntent) -> SubmitResult:
         now = self._clock.now_ms()
-        if self._kill is not None and self._kill.is_set() and not intent.is_exit:
+        if self._kill is not None and self._kill.is_set() and not intent.flatten:
             return SubmitResult("blocked", None, "kill switch is set")
         if self._entry_guard is not None and not intent.is_exit:
             veto = self._entry_guard(intent)  # e.g. the live gate, evaluated at the last moment
@@ -211,7 +245,7 @@ class OrderManager:
             return self._finish_rejected(record, f"{type(exc).__name__}: {exc}")
 
         self._apply(record, result)
-        return SubmitResult("accepted", record, "")
+        return SubmitResult(outcome_of(record), record, "")
 
     def _finish_retry_later(self, record: OrderRecord, note: str) -> SubmitResult:
         """Forget an order that provably never left, so the same intent can be tried again."""
@@ -265,17 +299,23 @@ class OrderManager:
             self._reconcile_one(record)
             if record.status not in UNCERTAIN_STATUSES:
                 break
-        outcome = "uncertain" if record.status in UNCERTAIN_STATUSES else "accepted"
-        return SubmitResult(outcome, record, note)
+        return SubmitResult(outcome_of(record), record, note)
 
     # ------------------------------------------------------------------ results / reconcile
 
     def _apply(self, record: OrderRecord, result: OrderResult) -> None:
-        """Adopt the venue's view of the order and record any fills not seen before."""
+        """Adopt the venue's view of the order and record any fills not seen before.
+
+        The order row and its new fills are written in ONE transaction, so a crash can never
+        leave a FILLED order without the fills that explain it.
+        """
         new_fills: list[Fill] = []
         known = len(self._store.fills_for(record.client_order_id))
-        if result.fills:
-            new_fills = result.fills[known:]
+        fills = result.fills
+        if not fills and result.executed_qty > record.executed_qty:
+            fills = self._exact_fills(record, result) or []
+        if fills:
+            new_fills = fills[known:]
         elif result.executed_qty > record.executed_qty:
             dq = result.executed_qty - record.executed_qty
             dquote = result.cumulative_quote_qty - record.cumulative_quote_qty
@@ -285,11 +325,28 @@ class OrderManager:
         record.executed_qty = result.executed_qty
         record.cumulative_quote_qty = result.cumulative_quote_qty
         record.updated_ms = self._clock.now_ms()
-        self._store.update_order(record)
-        if new_fills:
-            self._store.add_fills(record.client_order_id, new_fills, record.updated_ms)
-            if self._on_fill is not None:
-                self._on_fill(record, new_fills)
+        with self._store.transaction():
+            self._store.update_order(record)
+            if new_fills:
+                self._store.add_fills(record.client_order_id, new_fills, record.updated_ms)
+        if new_fills and self._on_fill is not None:
+            self._on_fill(record, new_fills)
+
+    def _exact_fills(self, record: OrderRecord, result: OrderResult) -> list[Fill] | None:
+        """Real per-trade fills (with commissions) when the venue's order answer carries none.
+
+        Only trusted when they add up to the executed quantity the order itself reports.
+        """
+        if not result.exchange_order_id:
+            return None
+        try:
+            fills = self._broker.order_fills(record.symbol, result.exchange_order_id)
+        except ExchangeError as exc:
+            log.warning("could not fetch trades of %s: %s", record.client_order_id, exc)
+            return None
+        if fills and sum((f.quantity for f in fills), Decimal(0)) == result.executed_qty:
+            return fills
+        return None
 
     def _reconcile_one(self, record: OrderRecord) -> None:
         try:
@@ -306,6 +363,32 @@ class OrderManager:
         if record.status in UNCERTAIN_STATUSES or record.status in OPEN_STATUSES:
             self._count_failed_attempt(record, "not found on venue after reconciliation")
 
+    def _requery_lost(self) -> None:
+        """Look again, slowly, at orders we gave up on: one may have surfaced at the venue."""
+        now = self._clock.now_ms()
+        for record in self._store.list_orders((OrderStatus.LOST,)):
+            if not self._store.kv_get(f"lost:{record.symbol}"):
+                continue  # a human already decided about this symbol
+            if now - record.updated_ms < LOST_REQUERY_MS:
+                continue
+            try:
+                result = self._broker.get_order(record.symbol, record.client_order_id)
+            except ExchangeError:
+                continue
+            record.updated_ms = now
+            if result is None or result.status in UNCERTAIN_STATUSES:
+                self._store.update_order(record)  # remember when we last looked
+                continue
+            self._apply(record, result)
+            self._notifier.notify(
+                "WARNING",
+                "Lost order found",
+                f"{record.symbol} {record.side} id={record.client_order_id} now reports "
+                f"{record.status} (executed {record.executed_qty}). Its fills were recorded.",
+            )
+            if not self._store.list_orders((OrderStatus.LOST,), record.symbol):
+                self._store.kv_set(f"lost:{record.symbol}", "")
+
     def _count_failed_attempt(self, record: OrderRecord, why: str) -> None:
         record.reconcile_attempts += 1
         record.updated_ms = self._clock.now_ms()
@@ -314,19 +397,28 @@ class OrderManager:
             return
         record.status = OrderStatus.LOST
         record.note = f"{record.note} | {why}"[:500]
-        self._store.update_order(record)
-        self._store.kv_set(f"lost:{record.symbol}", record.client_order_id)
+        with self._store.transaction():  # the record and the block on the symbol, or neither
+            self._store.update_order(record)
+            self._store.kv_set(f"lost:{record.symbol}", record.client_order_id)
         self._notifier.notify(
             "CRITICAL",
             "Order LOST",
             f"{record.symbol} {record.side} {record.quantity} id={record.client_order_id}: {why}. "
-            "It will NOT be re-sent. Check the exchange, then run 'botux resolve-lost'.",
+            "It will NOT be re-sent"
+            + (
+                "; further SELLs on this symbol are blocked too, so the position may be unprotected"
+                if record.side is Side.SELL
+                else ""
+            )
+            + ". Check the exchange, then run 'botux resolve-lost'. The bot keeps looking "
+            "for the order every few minutes.",
         )
 
     def reconcile_pending(self) -> None:
         """One reconciliation pass over every uncertain or open order (call every cycle)."""
         for record in self._store.list_orders((*UNCERTAIN_STATUSES, *OPEN_STATUSES)):
             self._reconcile_one(record)
+        self._requery_lost()
 
     # ------------------------------------------------------------------ cancel
 

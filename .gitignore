@@ -2,6 +2,14 @@
 .env
 .env.*
 !.env.example
+*.env
+.envrc
+*.jsonl
+*apikey*
+*api_key*
+*api-key*
+keys.json
+*_keys.*
 *.pem
 *.key
 *.p12
