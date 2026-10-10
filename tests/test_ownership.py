@@ -176,7 +176,8 @@ class TestUnexplainedBalances:
         h.cycle()
         assert h.loop.risk.blockers == {}
         assert not store.kv_get("ack:balances")  # consumed exactly once
-        assert store.kv_get("ledger:offset:BTC") == "0.3"
+        assert store.kv_get("baseline:BTC") == "0.3"  # the surplus is attributed to the user
+        assert store.kv_get("ledger:offset:BTC") == "0"
         assert h.loop._position_qty("BTCUSDT", h.paper.balances()) == 0
         assert [json.loads(e["detail"]) for e in store.events("balances_acknowledged")] == [
             {"offsets": ["BTC: +0.3"]}
@@ -318,3 +319,34 @@ class TestForeignOrders:
         assert "orders:BTCUSDT" in h.loop.risk.blockers  # fail closed for entries
         stops = [o for o in h.orders() if o.intent_key.startswith("stop:BTCUSDT:")]
         assert stops and stops[0].status is OrderStatus.FILLED  # protection was not starved
+
+
+class TestTheUsersOwnTradesDoNotHideTheBotsPosition:
+    """Review: if the user sold the coins he held before the bot started, the bot's own position
+    looked like zero (no stop-loss) and the daily loss was mis-stated."""
+
+    def test_ambiguity_is_reported_loudly_and_an_acknowledgement_restores_protection(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        h.paper._free["BTC"] = D(1)  # the user already held 1 BTC when the bot first looked
+        h.cycle()
+        h.cycle(hours=1)  # the bot buys
+        own = h.loop.order_manager.open_orders() or buys(h)
+        assert own
+        bought = h.paper.balances()["BTC"].free - D(1)
+        h.paper._free["BTC"] -= D(1)  # the user sells HIS coin on the exchange's own screen
+        h.feed.bid, h.feed.ask = D("90.00"), D("90.01")  # and the market falls through the stop
+        h.loop.run_cycle()
+        # the bot cannot prove which coins are its own, so it sells nothing and says so
+        assert [o for o in h.orders() if o.side is Side.SELL] == []
+        messages = [m for _, t, m in h.notifier.items if t == "Unexpected balance change"]
+        assert messages and "NOT covered by the stop-loss" in messages[0]
+        # a human looks, confirms, and acknowledges: the whole remaining balance is the bot's
+        store.kv_set("ack:balances", "1")
+        h.clock.advance(61)
+        h.loop.run_cycle()
+        assert store.kv_get("baseline:BTC") == "0"
+        stops = [o for o in h.orders() if o.intent_key.startswith("stop:")]
+        assert stops and stops[0].status is OrderStatus.FILLED
+        assert stops[0].quantity <= bought

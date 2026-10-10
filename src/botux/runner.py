@@ -21,6 +21,7 @@ from botux.decimals import ZERO
 from botux.errors import (
     BotuxError,
     ConfigError,
+    DataError,
     ExchangeError,
     LiveTradingNotAllowed,
     StorageError,
@@ -123,6 +124,8 @@ class TradingLoop:
         self._alerted_at: dict[str, float] = {}
         self._retries: dict[tuple[str, int], int] = {}
         self._last_positions: dict[str, Decimal] = {}
+        self._last_mid: dict[str, Decimal] = {}
+        self._warmed: set[str] = set()
         self._baseline: dict[str, Decimal] = {}
         self.stopped = False
         self.cycles = 0
@@ -192,10 +195,13 @@ class TradingLoop:
     def run(self, max_cycles: int | None = None) -> None:
         log.info("trading loop started (%s)", ", ".join(self._s.market.symbols))
         while not (self._stop_requested or self.stopped):
+            started = self._clock.monotonic()
             self.run_cycle()
             if self.stopped or (max_cycles is not None and self.cycles >= max_cycles):
                 break
-            self._sleep_interruptibly(self._s.market.poll_seconds)
+            # a fixed cadence: the time the cycle itself took counts toward the pause
+            elapsed = self._clock.monotonic() - started
+            self._sleep_interruptibly(max(0.0, self._s.market.poll_seconds - elapsed))
         if not self.stopped:
             self._shutdown("stop requested" if self._stop_requested else "cycle limit reached")
 
@@ -212,12 +218,7 @@ class TradingLoop:
         except Exception:
             log.exception("failed to cancel open orders during shutdown")
             cancelled = -1
-        self._store.log_event(
-            self._clock.now_ms(),
-            "INFO",
-            "shutdown",
-            {"why": why, "cancelled_open_orders": cancelled},
-        )
+        self._safe_event("INFO", "shutdown", {"why": why, "cancelled_open_orders": str(cancelled)})
         log.info("trading loop stopped: %s", why)
         self.stopped = True
 
@@ -230,7 +231,15 @@ class TradingLoop:
             self._notifier.notify(level, title, message)
 
     def _open_positions_text(self) -> str:
-        held = {s: q for s, q in self._last_positions.items() if q > 0}
+        """Positions the bot holds, read afresh when possible (alerts must never omit one)."""
+        try:
+            balances = self._broker.balances()
+            held = {s: self._position_qty(s, balances) for s in self._s.market.symbols}
+        except Exception:
+            held = dict(self._last_positions)
+            if not held:
+                return "unknown (balances could not be read)"
+        held = {s: q for s, q in held.items() if q > 0}
         return ", ".join(f"{s}={q}" for s, q in held.items()) or "none"
 
     # ------------------------------------------------------------------ one cycle
@@ -246,12 +255,15 @@ class TradingLoop:
             self._risk.record_success()
         except Exception as exc:
             log.error("cycle %d failed: %s: %s", self.cycles, type(exc).__name__, exc)
-            self._store.log_event(
-                self._clock.now_ms(),
-                "ERROR",
-                "cycle_error",
-                {"type": type(exc).__name__, "message": str(exc)[:300]},
-            )
+            try:
+                self._store.log_event(
+                    self._clock.now_ms(),
+                    "ERROR",
+                    "cycle_error",
+                    {"type": type(exc).__name__, "message": str(exc)[:300]},
+                )
+            except Exception:  # a broken database must not turn one error into a dead loop
+                log.exception("could not record the cycle error (is the database usable?)")
             if self._risk.record_error():
                 reason = (
                     f"{self._risk.consecutive_errors} consecutive errors; "
@@ -304,9 +316,7 @@ class TradingLoop:
             except Exception:
                 reason = "kill switch set"
             self._notifier.notify("CRITICAL", "EMERGENCY STOP", reason)
-            self._store.log_event(
-                self._clock.now_ms(), "CRITICAL", "kill_switch", {"reason": reason}
-            )
+            self._safe_event("CRITICAL", "kill_switch", {"reason": reason})
             try:
                 self._om.reconcile_pending()  # learn what happened to anything in flight
             except Exception:
@@ -327,10 +337,7 @@ class TradingLoop:
                 )
             if self._s.risk.flatten_on_kill:
                 for sym in self._s.market.symbols:
-                    try:
-                        self._flatten(sym, "flatten_on_kill")
-                    except Exception:
-                        log.exception("flatten failed for %s", sym)
+                    self._flatten_with_retries(sym)
             else:
                 held = self._open_positions_text()
                 if held != "none":
@@ -342,6 +349,28 @@ class TradingLoop:
                     )
         finally:
             self.stopped = True
+
+    FLATTEN_ATTEMPTS = 3
+
+    def _flatten_with_retries(self, symbol: str) -> None:
+        """Try to sell the position at the emergency stop. If reading balances or the quote keeps
+        failing, SAY so: the stop must never end with the operator believing the account is flat."""
+        for attempt in range(1, self.FLATTEN_ATTEMPTS + 1):
+            try:
+                self._flatten(symbol, "flatten_on_kill")
+                return
+            except Exception as exc:
+                log.exception("flatten of %s failed (attempt %d)", symbol, attempt)
+                if attempt == self.FLATTEN_ATTEMPTS:
+                    self._notifier.notify(
+                        "CRITICAL",
+                        "Flatten failed",
+                        f"{symbol}: could not sell the position at the emergency stop "
+                        f"({type(exc).__name__}). It may still be OPEN and nothing manages it: "
+                        "close it by hand.",
+                    )
+                else:
+                    self._clock.sleep(2.0)
 
     def _flatten(self, symbol: str, why: str) -> None:
         rules = self._rules[symbol]
@@ -407,18 +436,25 @@ class TradingLoop:
         """Sellable amount that belongs to the bot (only FREE coins can be sold)."""
         return self._owned(symbol, balances)[1]
 
+    def _safe_event(self, level: str, kind: str, detail: dict[str, str]) -> None:
+        """Record an event; a failing database must never cost us the rest of the cycle."""
+        try:
+            self._store.log_event(self._now(), level, kind, detail)
+        except Exception:
+            log.exception("could not record event %s", kind)
+
     def _block(self, key: str, reason: str, *, alert: str | None = None) -> None:
         """Block new entries (exits stay possible) while ``reason`` holds."""
         if self._risk.set_blocker(key, reason):
             log.warning("entries blocked [%s]: %s", key, reason)
-            self._store.log_event(self._now(), "CRITICAL", "entries_blocked", {key: reason})
+            self._safe_event("CRITICAL", "entries_blocked", {key: reason})
         if alert is not None:
             self._alert_throttled(f"block:{key}", "CRITICAL", alert, reason)
 
     def _unblock(self, key: str) -> None:
         if self._risk.clear_blocker(key):
             log.warning("entries unblocked [%s]", key)
-            self._store.log_event(self._now(), "INFO", "entries_unblocked", {"key": key})
+            self._safe_event("INFO", "entries_unblocked", {"key": key})
 
     def _check_ownership(self, balances: Mapping[str, Balance], led: LedgerView) -> Decimal:
         """Compare real balances with what the bot's own fills explain.
@@ -440,21 +476,35 @@ class TradingLoop:
             bal = balances.get(base)
             total = bal.total if bal is not None else ZERO
             offset = self._ledger.offset(base)
-            disc = balance_discrepancy(
-                total, self._baseline_for(base, total), led.base_qty(sym), offset
-            )
+            baseline = self._baseline_for(base, total)
+            ledger_qty = led.base_qty(sym)
+            disc = balance_discrepancy(total, baseline, ledger_qty, offset)
             if ack and settled and disc != 0:
-                self._ledger.set_offset(base, offset + disc)
+                # A human has looked: whatever lies beyond the bot's own records is the user's
+                # (baseline); if the account holds LESS than the records say, the bot owns less.
+                new_baseline = max(ZERO, total - ledger_qty)
+                new_offset = min(ZERO, total - ledger_qty)
+                self._store.kv_set(f"baseline:{base}", str(new_baseline))
+                self._baseline[base] = new_baseline
+                self._ledger.set_offset(base, new_offset)
                 acknowledged.append(f"{base}: {disc:+f}")
                 disc = ZERO
             if not settled:
                 continue
             if abs(disc) > self._ledger.tolerance(sym, led):
+                unprotected = ledger_qty > owned_base(total, baseline, ledger_qty, offset)
                 self._block(
                     f"balance:{base}",
                     f"{base} on the account differs from the bot's own records by {disc:+f} "
                     "(deposit, withdrawal, manual trade or an unrecorded fill?). Verify on the "
-                    "exchange, then run 'botux ack-balances'. Nothing was sold or cancelled.",
+                    "exchange, then run 'botux ack-balances'. Nothing was sold or cancelled."
+                    + (
+                        f" The bot's recorded position ({ledger_qty} {base}) is NOT covered by "
+                        "the stop-loss until this is resolved, because the bot cannot prove which "
+                        "coins are its own."
+                        if unprotected
+                        else ""
+                    ),
                     alert="Unexpected balance change",
                 )
             else:
@@ -538,7 +588,7 @@ class TradingLoop:
         for sym in self._s.market.symbols:
             owned_total, sellable = self._owned(sym, balances, led)
             qty[sym] = sellable
-            notional[sym] = owned_total * quotes[sym].mid
+            notional[sym] = owned_total * self._mid(sym, quotes, needed=owned_total > 0)
             equity += notional[sym]
         self._last_positions = dict(qty)
         day_start = (self._now() // DAY_MS) * DAY_MS
@@ -554,10 +604,27 @@ class TradingLoop:
         self._persist_blockers()
         return equity, view
 
+    def _mid(self, sym: str, quotes: Mapping[str, Quote], *, needed: bool) -> Decimal:
+        """Mid price of ``sym``: this cycle's quote, else the last one seen (a symbol whose quote
+        failed is still valued so the other symbols' sizing is not distorted)."""
+        quote = quotes.get(sym)
+        if quote is not None:
+            self._last_mid[sym] = quote.mid
+            return quote.mid
+        known = self._last_mid.get(sym)
+        if known is None:
+            if needed:
+                raise DataError(f"no price known for {sym}, which holds a position")
+            return ZERO
+        return known
+
     def _persist_blockers(self) -> None:
         raw = json.dumps(self._risk.blockers, sort_keys=True)
-        if self._store.kv_get(BLOCKERS_KEY) != raw:
-            self._store.kv_set(BLOCKERS_KEY, raw)
+        try:
+            if self._store.kv_get(BLOCKERS_KEY) != raw:
+                self._store.kv_set(BLOCKERS_KEY, raw)
+        except Exception:
+            log.exception("could not persist the entry blockers")
 
     # ------------------------------------------------------------------ the cycle
 
@@ -621,20 +688,31 @@ class TradingLoop:
         now = self._now()
         self._health_probe(now)
         self._maybe_refresh_rules()
-        self._om.reconcile_pending()
+        errors: list[Exception] = []
+        try:
+            self._om.reconcile_pending()
+        except Exception as exc:  # protection must not depend on reconciliation succeeding
+            log.error("reconciliation failed: %s: %s", type(exc).__name__, exc)
+            errors.append(exc)
 
+        # One symbol's broken quote must not take the others (or their stop-losses) down.
         quotes: dict[str, Quote] = {}
         for sym in self._s.market.symbols:
-            quotes[sym] = self._feed.quote(sym)
+            try:
+                quotes[sym] = self._feed.quote(sym)
+            except Exception as exc:
+                log.error("%s quote failed: %s: %s", sym, type(exc).__name__, exc)
+                errors.append(exc)
+                continue
             if self._paper is not None:
                 self._paper.set_quote(quotes[sym])
+        if not quotes:
+            raise errors[0] if errors else DataError("no quotes at all")
 
         self._check_open_orders()
         equity, view = self._snapshot(quotes)
         self._risk.update_equity(now, equity)
         self._apply_daily_loss_reset(equity)
-        self._store.kv_set("risk_state", json.dumps(self._risk.export_state()))
-        self._store.add_equity(now, equity, view.free_quote)
         day = now // DAY_MS
         if self._risk.daily_loss_halted and self._halt_alerted_day != day:
             self._halt_alerted_day = day
@@ -646,14 +724,14 @@ class TradingLoop:
                 "NOT end at midnight).",
             )
 
-        errors: list[Exception] = []
-
         # 1) Protection first. It needs only quotes and balances, never candle data, so a broken
         #    kline feed cannot disable the stop-loss. One failing symbol must not starve others.
         acted = False
         for sym in self._s.market.symbols:
             if self._kill.is_set():
                 return  # the next run_cycle performs the emergency-stop policy
+            if sym not in quotes:
+                continue
             try:
                 acted |= self._protect(sym, quotes[sym], view)
             except Exception as exc:
@@ -662,10 +740,20 @@ class TradingLoop:
         if acted:
             equity, view = self._snapshot(quotes)
 
+        # Bookkeeping comes AFTER protection: a full disk must not be able to skip a stop-loss.
+        try:
+            self._store.kv_set("risk_state", json.dumps(self._risk.export_state()))
+            self._store.add_equity(now, equity, view.free_quote)
+        except Exception as exc:
+            log.error("could not persist the cycle state: %s: %s", type(exc).__name__, exc)
+            errors.append(exc)
+
         # 2) Signals, which do need validated candles.
         for sym in self._s.market.symbols:
             if self._kill.is_set():
                 return
+            if sym not in quotes:
+                continue
             try:
                 candles = self._feed.closed_candles(sym, self._strategy.warmup + 2)
                 validate_live_candles(
@@ -678,6 +766,11 @@ class TradingLoop:
                 errors.append(exc)
         if errors:
             raise errors[0]
+
+    def _max_signal_age_ms(self) -> int:
+        """An entry is only taken soon after its candle closed: half an interval at most (10
+        minutes cap), but never less than three polls so a normal cycle always qualifies."""
+        return max(min(self._s.interval_ms // 2, 600_000), int(self._s.market.poll_seconds * 3000))
 
     def _apply_daily_loss_reset(self, equity: Decimal) -> None:
         """Consume a `botux reset-daily-loss` request (a human decision, never automatic)."""
@@ -739,10 +832,16 @@ class TradingLoop:
         last = candles[-1]
         key = f"lastc:{sym}"
         seen = self._store.kv_get(key)
-        if seen is None and not self._act_current:
-            self._store.kv_set(key, str(last.open_time_ms))
-            log.info("%s: warm start, waiting for the next candle before trading", sym)
+        if sym not in self._warmed and not self._act_current:
+            # Every process start begins with a warm-up: the newest closed candle is noted and
+            # not traded, however long ago the previous run stopped, so a restart can never act
+            # on a stale signal.
+            self._warmed.add(sym)
+            if seen in (None, "") or last.open_time_ms > int(seen):
+                self._store.kv_set(key, str(last.open_time_ms))
+                log.info("%s: warm start, waiting for the next candle before trading", sym)
             return False
+        self._warmed.add(sym)
         previous = int(seen) if seen not in (None, "") else None
         if previous is not None and last.open_time_ms <= previous:
             return False  # same candle again, or a stale answer from the API: never go backwards
@@ -752,6 +851,10 @@ class TradingLoop:
         log.info("%s signal=%s in_position=%s equity=%.2f", sym, signal, in_position, view.equity)
         result: SubmitResult | None = None
         if signal is Signal.ENTER_LONG and not in_position:
+            age_ms = self._now() - last.close_time_ms
+            if age_ms > self._max_signal_age_ms():
+                log.warning("%s entry skipped: the signal is %d s old", sym, age_ms // 1000)
+                return False
             blocked = self._om.is_symbol_blocked(sym)
             if blocked:
                 log.warning("%s entry skipped: %s", sym, blocked)

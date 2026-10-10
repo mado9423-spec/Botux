@@ -294,3 +294,47 @@ class TestDailyLossAndErrors:
 
     def test_clock_parameter_is_optional(self) -> None:
         RiskManager(RiskSettings(), fee_rate=FEE, slippage_bps=SLIP, clock=FakeClock())
+
+
+class TestHardCapsHoldAtTheWorstFill:
+    """Review: caps were measured at the ask, so a market order filled with slippage could exceed
+    max_order_notional (100.06 against a cap of 100)."""
+
+    def test_sized_orders_cannot_exceed_the_cap_even_after_slippage(
+        self, rules: SymbolRules
+    ) -> None:
+        rm = make_rm(max_order_notional=D(100))
+        res = rm.size_entry(rules, PRICE, view())
+        worst_fill = PRICE * (1 + SLIP / D(10_000))
+        assert res.binding == "max_order_notional"
+        assert res.quantity * worst_fill <= D(100)
+
+    def test_the_final_gate_also_measures_at_the_worst_fill(self, rules: SymbolRules) -> None:
+        rm = make_rm(max_order_notional=D(100))
+        ask = D("50000")
+        fine = rm.check_order(rules, Side.BUY, OrderType.MARKET, D("0.00199"), None, ask, view())
+        assert fine.allowed
+        # 0.002 x 50000 = exactly 100.00 at the ask, but 100.05 once the modelled slippage applies
+        edge = rm.check_order(rules, Side.BUY, OrderType.MARKET, D("0.002"), None, ask, view())
+        assert not edge.allowed and any("max_order_notional" in r for r in edge.reasons)
+
+    def test_a_limit_order_is_measured_at_its_own_price(self, rules: SymbolRules) -> None:
+        rm = make_rm(max_order_notional=D(100))
+        ask = D("50000")
+        limit = rm.check_order(
+            rules, Side.BUY, OrderType.LIMIT, D("0.002"), ask, ask, view()
+        )  # a limit order cannot fill above its price: exactly 100.00 is allowed
+        assert limit.allowed
+
+    @given(
+        price=st.decimals(min_value="1", max_value="100000", places=2),
+        cap=st.decimals(min_value="10", max_value="5000", places=0),
+    )
+    @settings(max_examples=60, deadline=None)
+    def test_property_sized_quantity_never_exceeds_the_cap_at_the_worst_fill(
+        self, price: Decimal, cap: Decimal
+    ) -> None:
+        rules = SymbolRules.from_exchange_info(EXCHANGE_INFO_BTCUSDT, "BTCUSDT")
+        rm = make_rm(max_order_notional=cap, max_position_notional=cap, max_total_exposure=cap)
+        res = rm.size_entry(rules, price, view(equity="100000", free="100000"))
+        assert res.quantity * price * (1 + SLIP / D(10_000)) <= cap

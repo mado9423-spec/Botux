@@ -224,11 +224,14 @@ class RiskManager:
         risk_budget = view.equity * self.s.risk_per_trade_pct
         # Loss if the stop is hit: the stop distance plus slippage and fees on BOTH legs.
         loss_per_unit = price * (self.s.stop_loss_pct + 2 * self._slip + 2 * self._fee)
+        # The hard caps are measured at the WORST expected fill (ask plus modelled slippage), so
+        # the executed notional of a market order cannot exceed them.
+        worst = price * (1 + self._slip) if order_type is OrderType.MARKET else price
         candidates: dict[str, Decimal] = {
             "risk_per_trade": risk_budget / loss_per_unit,
-            "max_order_notional": self.s.max_order_notional / price,
-            "max_position_notional": (self.s.max_position_notional - pos_notional) / price,
-            "max_total_exposure": (self.s.max_total_exposure - total_exposure) / price,
+            "max_order_notional": self.s.max_order_notional / worst,
+            "max_position_notional": (self.s.max_position_notional - pos_notional) / worst,
+            "max_total_exposure": (self.s.max_total_exposure - total_exposure) / worst,
             "available_cash": view.free_quote / (price * self._unit_cost_factor()),
         }
         binding, raw_qty = min(candidates.items(), key=lambda kv: kv[1])
@@ -302,7 +305,9 @@ class RiskManager:
                 reasons.append(why)
             if view.orders_today >= self.s.max_orders_per_day:
                 reasons.append(f"max_orders_per_day ({self.s.max_orders_per_day}) reached")
-            notional = quantity * eff_price
+            notional = (
+                quantity * eff_price * (1 + self._slip if order_type is OrderType.MARKET else 1)
+            )
             if notional > self.s.max_order_notional:
                 reasons.append(
                     f"order notional {notional:.2f} > max_order_notional "
