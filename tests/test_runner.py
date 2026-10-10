@@ -524,8 +524,28 @@ class TestBookkeepingAndBaseline:
         assert store.kv_get("baseline:BTC") == "1.0"
         h.loop._baseline.clear()  # a new process starts: the baseline must be read back from disk
         assert h.loop._position_qty("BTCUSDT", balances) == 0
-        # only coins above the baseline are the bot's, and only FREE ones can be sold
+        # coins above the baseline that the bot's OWN fills do not explain are not the bot's
         more = {"BTC": Balance(free=D("1.2"), locked=D("0.5"))}
+        assert h.loop._position_qty("BTCUSDT", more) == 0
+        now = h.clock.now_ms()
+        store.insert_order(
+            OrderRecord(
+                "c0",
+                "k0",
+                "BTCUSDT",
+                Side.BUY,
+                OrderType.MARKET,
+                D("0.7"),
+                None,
+                OrderStatus.FILLED,
+                now,
+                now,
+                executed_qty=D("0.7"),
+                cumulative_quote_qty=D("70"),
+            )
+        )
+        store.add_fills("c0", [Fill(D("100"), D("0.7"), D(0), "BTC")], now)
+        # ... once its own fills explain them, they are, and only FREE ones can be sold
         assert h.loop._position_qty("BTCUSDT", more) == D("0.7")
         locked_up = {"BTC": Balance(free=D("0.1"), locked=D("1.6"))}
         assert h.loop._position_qty("BTCUSDT", locked_up) == D("0.1")

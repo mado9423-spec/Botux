@@ -209,7 +209,8 @@ def cmd_paper(args: argparse.Namespace) -> int:
 def cmd_live(args: argparse.Namespace) -> int:
     s = _settings(args)
     setup_logging()
-    app = build_live_app(s, os.environ)  # raises LiveTradingNotAllowed unless fully armed
+    # raises LiveTradingNotAllowed unless fully armed; the settings file is re-read while running
+    app = build_live_app(s, os.environ, reload_settings=lambda: _settings(args))
     _install_signal_handlers(app)
     try:
         app.loop.run(max_cycles=args.max_cycles)
@@ -273,6 +274,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 f"  ATTENTION {o.status.value}: {o.symbol} {o.side.value} {o.quantity} "
                 f"id={o.client_order_id}"
             )
+        blockers = json.loads(store.kv_get("entry_blockers") or "{}")
+        for key, why in sorted(blockers.items()):
+            print(f"  NEW ENTRIES BLOCKED [{key}]: {why}")
         store.close()
     return 0
 
@@ -306,6 +310,56 @@ def cmd_resolve_lost(args: argparse.Namespace) -> int:
     store.log_event(SystemClock().now_ms(), "WARNING", "resolve_lost", {"symbol": args.symbol})
     store.close()
     print(f"{args.symbol}: LOST flag cleared in the {args.mode} database by operator decision.")
+    return 0
+
+
+def cmd_ack_balances(args: argparse.Namespace) -> int:
+    """Record that a human has looked at an unexplained balance difference.
+
+    Bookkeeping only: nothing is sent to the exchange and nothing is sold or cancelled. The loop
+    applies it on its next cycle (a surplus is treated as external; a deficit as a loss of bot
+    capital) and then lifts the corresponding block on new entries.
+    """
+    if not args.confirm_checked:
+        raise BotuxError(
+            "refusing without --confirm-checked: first compare the account with the bot's records "
+            "on the exchange yourself (see 'botux status'), then repeat with --confirm-checked"
+        )
+    s = _settings(args)
+    db = Path(database_path(s, args.mode))
+    if not db.exists():
+        raise BotuxError(f"no {args.mode} database at {db}")
+    store = Store(db)
+    store.kv_set("ack:balances", str(SystemClock().now_ms()))
+    store.log_event(SystemClock().now_ms(), "WARNING", "ack_balances_requested", {})
+    store.close()
+    print(
+        f"[{args.mode}] acknowledgement recorded; the running (or next) cycle will accept the "
+        "current balances as they are. Nothing was sent to the exchange."
+    )
+    return 0
+
+
+def cmd_reset_daily_loss(args: argparse.Namespace) -> int:
+    """Human decision to lift a tripped daily-loss halt (it does not end at midnight by itself)."""
+    if not args.confirm_checked:
+        raise BotuxError(
+            "refusing without --confirm-checked: first find out WHY the daily loss limit was "
+            "reached ('botux status', the log and the exchange), then repeat with "
+            "--confirm-checked. Resetting gives the bot a fresh daily allowance."
+        )
+    s = _settings(args)
+    db = Path(database_path(s, args.mode))
+    if not db.exists():
+        raise BotuxError(f"no {args.mode} database at {db}")
+    store = Store(db)
+    store.kv_set("ack:daily_loss", str(SystemClock().now_ms()))
+    store.log_event(SystemClock().now_ms(), "WARNING", "daily_loss_reset_requested", {})
+    store.close()
+    print(
+        f"[{args.mode}] reset recorded; the running (or next) cycle lifts the halt and starts a "
+        "fresh daily reference. Nothing was sent to the exchange."
+    )
     return 0
 
 
@@ -376,6 +430,28 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("symbol")
     r.add_argument("--mode", choices=["paper", "live"], default="live")
     r.set_defaults(func=cmd_resolve_lost)
+    a = sub.add_parser(
+        "ack-balances",
+        help="accept unexplained balance differences once checked (bookkeeping only)",
+    )
+    a.add_argument("--mode", choices=["paper", "live"], default="live")
+    a.add_argument(
+        "--confirm-checked",
+        action="store_true",
+        help="I compared the account with the bot's records and accept the difference",
+    )
+    a.set_defaults(func=cmd_ack_balances)
+    d = sub.add_parser(
+        "reset-daily-loss",
+        help="lift a tripped daily-loss halt after finding out why (human decision)",
+    )
+    d.add_argument("--mode", choices=["paper", "live"], default="live")
+    d.add_argument(
+        "--confirm-checked",
+        action="store_true",
+        help="I know why the limit was reached and accept a fresh daily allowance",
+    )
+    d.set_defaults(func=cmd_reset_daily_loss)
     return p
 
 

@@ -19,6 +19,10 @@ class FilterViolation(BotuxError):
     """An order violates the exchange's symbol filters (tick size, lot size, notional...)."""
 
 
+class StorageError(BotuxError):
+    """The local database cannot be trusted (failed integrity check, unwritable)."""
+
+
 class DataError(BotuxError):
     """Market data is missing, inconsistent, stale or otherwise unusable."""
 

@@ -30,10 +30,19 @@ quote_asset = "USDT"
 # Fraction of equity risked if the stop-loss is hit (0.005 = 0.5%).
 risk_per_trade_pct = "0.005"
 stop_loss_pct = "0.02"
+# The part of the account the bot may treat as ITS OWN money (quote-asset units). Equity, sizing and
+# the daily-loss limit use only this plus the bot's own fills; the rest of the account is never
+# sized from or touched. Paper mode: omitted = the whole simulated balance. LIVE mode: REQUIRED,
+# no default - you choose the amount (use a dedicated sub-account; see docs/LIVE_TRADING_CHECKLIST.md).
+# bot_capital = "500"
+# Abstain from NEW entries while (ask - bid) / mid is wider than this fraction.
+max_spread_pct = "0.005"
 # Hard caps, in quote-asset units (USDT).
 max_order_notional = "100"
 max_position_notional = "200"
 max_total_exposure = "300"
+# Daily loss = the bot's equity at the first reading of the UTC day minus now (realized + unrealized,
+# after fees). Once reached, new entries stop until a human runs `botux reset-daily-loss`.
 max_daily_loss = "20"
 max_open_orders = 3
 max_orders_per_day = 20

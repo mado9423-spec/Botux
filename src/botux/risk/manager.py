@@ -70,6 +70,11 @@ class RiskManager:
         self._daily_loss_halted = False
         self._consecutive_errors = 0
         self._hard_halt: str | None = None
+        # Conditions recomputed from facts every cycle (foreign orders, balance mismatches, failed
+        # health checks). Unlike ``_hard_halt`` they are never persisted: they clear themselves
+        # when the fact goes away, or after a human acknowledges it.
+        self._blockers: dict[str, str] = {}
+        self._rebase_pending = False
 
     # ------------------------------------------------------------------ state
 
@@ -89,16 +94,55 @@ class RiskManager:
         """Stop all new entries until a human restarts the bot (sticky)."""
         self._hard_halt = reason
 
+    @property
+    def blockers(self) -> dict[str, str]:
+        return dict(self._blockers)
+
+    def set_blocker(self, key: str, reason: str) -> bool:
+        """Block new entries while ``reason`` holds. Returns True when it is newly raised."""
+        new = self._blockers.get(key) != reason
+        self._blockers[key] = reason
+        return new
+
+    def clear_blocker(self, key: str) -> bool:
+        """Lift one blocker. Returns True when it was set."""
+        return self._blockers.pop(key, None) is not None
+
+    def rebase_day_start(self) -> None:
+        """Use the next equity reading as today's reference (e.g. after the bot capital changed).
+
+        The daily-loss halt, if tripped, stays tripped: only a human reset lifts it.
+        """
+        self._rebase_pending = True
+
     def update_equity(self, now_ms: int, equity: Decimal) -> None:
-        """Roll the UTC day and trip the daily-loss halt when the limit is reached."""
+        """Track the UTC-day reference and trip the daily-loss halt when the limit is reached.
+
+        "Daily loss" = the BOT's equity at the day's first reading minus the current equity, in
+        the quote asset: realized and unrealized, after fees and slippage already paid. Once
+        tripped the halt does NOT end at midnight; only :meth:`reset_daily_loss` (a human
+        decision) lifts it.
+        """
         day = now_ms // DAY_MS
+        if self._rebase_pending and self._day_start_equity is not None:
+            self._rebase_pending = False
+            self._day_start_equity = equity
         if self._day != day:
             self._day = day
             self._day_start_equity = equity
-            self._daily_loss_halted = False  # new UTC day: the daily limit starts fresh
         assert self._day_start_equity is not None
         if equity - self._day_start_equity <= -self.s.max_daily_loss:
             self._daily_loss_halted = True
+
+    def reset_daily_loss(self, equity: Decimal) -> bool:
+        """Human decision: lift the daily-loss halt and start a fresh reference at ``equity``.
+
+        Returns True when a halt was actually lifted.
+        """
+        was = self._daily_loss_halted
+        self._daily_loss_halted = False
+        self._day_start_equity = equity
+        return was
 
     def daily_pnl(self, equity: Decimal) -> Decimal:
         return ZERO if self._day_start_equity is None else equity - self._day_start_equity
@@ -138,7 +182,15 @@ class RiskManager:
         if self._hard_halt:
             return False, f"trading halted: {self._hard_halt}"
         if self._daily_loss_halted:
-            return False, "daily loss limit reached; no new entries until the next UTC day"
+            return (
+                False,
+                "daily loss limit reached; no new entries until a human runs "
+                "'botux reset-daily-loss'",
+            )
+        if self._blockers:
+            return False, "entries blocked: " + "; ".join(
+                f"{k}: {v}" for k, v in sorted(self._blockers.items())
+            )
         return True, ""
 
     def stop_price(self, entry_price: Decimal) -> Decimal:

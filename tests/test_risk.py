@@ -228,7 +228,7 @@ class TestOrderGate:
 
 
 class TestDailyLossAndErrors:
-    def test_daily_loss_halts_entries_and_resets_next_utc_day(self) -> None:
+    def test_daily_loss_halts_entries_and_only_a_human_lifts_it(self) -> None:
         rm = make_rm(max_daily_loss=D(20))
         day0 = 100 * DAY_MS + 3_600_000
         rm.update_equity(day0, D(1000))
@@ -237,8 +237,40 @@ class TestDailyLossAndErrors:
         rm.update_equity(day0 + 2000, D(980))  # exactly -20: limit reached
         assert halted(rm) and not rm.entries_allowed()[0]
         assert rm.daily_pnl(D(980)) == D(-20)
-        rm.update_equity(101 * DAY_MS + 1, D(980))  # next UTC day
-        assert not halted(rm) and rm.day_start_equity == D(980)
+        # midnight does NOT lift it (the day's reference moves, the halt stays) ...
+        rm.update_equity(101 * DAY_MS + 1, D(980))
+        assert halted(rm) and rm.day_start_equity == D(980)
+        assert "reset-daily-loss" in rm.entries_allowed()[1]
+        rm.update_equity(102 * DAY_MS + 1, D(1100))  # not even a recovery does
+        assert halted(rm)
+        # ... a human decision does, and starts a fresh reference
+        assert rm.reset_daily_loss(D(1100)) is True
+        assert not halted(rm) and rm.day_start_equity == D(1100) and rm.entries_allowed()[0]
+        assert rm.reset_daily_loss(D(1100)) is False  # nothing left to lift
+        rm.update_equity(102 * DAY_MS + 2, D(1080))  # the limit applies afresh
+        assert halted(rm)
+
+    def test_rebase_moves_the_reference_without_lifting_a_halt(self) -> None:
+        rm = make_rm(max_daily_loss=D(20))
+        rm.update_equity(5 * DAY_MS, D(1000))
+        rm.rebase_day_start()
+        rm.update_equity(5 * DAY_MS + 5, D(400))  # capital was reduced by the operator
+        assert rm.day_start_equity == D(400) and not halted(rm)
+        rm.update_equity(5 * DAY_MS + 6, D(370))
+        assert halted(rm)
+        rm.rebase_day_start()
+        rm.update_equity(5 * DAY_MS + 7, D(370))
+        assert halted(rm)  # a rebase never un-halts
+
+    def test_blockers_stop_entries_and_clear_themselves(self) -> None:
+        rm = make_rm()
+        assert rm.set_blocker("balance:BTC", "x") is True
+        assert rm.set_blocker("balance:BTC", "x") is False  # unchanged: not "new"
+        ok, why = rm.entries_allowed()
+        assert not ok and "balance:BTC" in why
+        assert rm.clear_blocker("balance:BTC") is True and rm.clear_blocker("balance:BTC") is False
+        assert rm.entries_allowed()[0]
+        assert "blockers" not in rm.export_state()  # recomputed from facts, never persisted
 
     def test_state_survives_a_restart(self) -> None:
         rm = make_rm(max_daily_loss=D(20))

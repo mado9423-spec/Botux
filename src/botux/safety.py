@@ -122,6 +122,11 @@ def check_live_gate(settings: Settings, kill: KillSwitch, now_ms: int) -> LiveAu
         problems.append("[live].enabled is false")
     if kill.is_set():
         problems.append(f"kill switch is set ({kill.reason()})")
+    if settings.risk.bot_capital is None:
+        problems.append(
+            "risk.bot_capital is not set: choose explicitly how much of the account the bot may "
+            "use (the rest of the account is never touched)"
+        )
 
     fingerprint = settings_fingerprint(settings)
     armed_at = 0

@@ -10,8 +10,8 @@ import httpx
 
 from botux.alerts import CompositeNotifier, FileNotifier, LogNotifier
 from botux.clock import Clock, SystemClock
-from botux.config import Settings, database_path
-from botux.errors import ConfigError, ExchangeError, LiveTradingNotAllowed
+from botux.config import Settings, database_path, settings_fingerprint
+from botux.errors import BotuxError, ConfigError, ExchangeError, LiveTradingNotAllowed
 from botux.exchange.client import BinanceSpotClient
 from botux.exchange.rules import SymbolRules
 from botux.execution.broker import Broker
@@ -29,7 +29,16 @@ from botux.strategy.base import create_strategy
 log = logging.getLogger(__name__)
 
 # Keys that describe a paper session's in-memory state; cleared when a new paper session starts.
-_PAPER_SESSION_PREFIXES = ("pos:", "lastc:", "baseline:", "lost:", "risk_state")
+_PAPER_SESSION_PREFIXES = (
+    "pos:",
+    "lastc:",
+    "baseline:",
+    "lost:",
+    "risk_state",
+    "ledger:",
+    "ack:",
+    "entry_blockers",
+)
 
 
 @dataclass
@@ -193,14 +202,30 @@ KEY_RECHECK_SECONDS = 3600.0
 
 
 def make_gate_check(
-    settings: Settings, kill: KillSwitch, clock: Clock, client: BinanceSpotClient
+    settings: Settings,
+    kill: KillSwitch,
+    clock: Clock,
+    client: BinanceSpotClient,
+    reload_settings: Callable[[], Settings] | None = None,
 ) -> Callable[[], None]:
-    """Re-verify the live gate while running: arming file (cheap, every call) and the API key's
-    permissions (network, at most hourly; a failed lookup is logged and retried later)."""
+    """Re-verify the live gate while running: arming file and settings on disk (cheap, every
+    call) and the API key's permissions (network, at most hourly; a failed lookup is logged and
+    retried later)."""
     last_key_check = clock.monotonic()
+    running = settings_fingerprint(settings)
 
     def check() -> None:
         nonlocal last_key_check
+        if reload_settings is not None:
+            try:
+                on_disk = reload_settings()
+            except BotuxError as exc:
+                raise LiveTradingNotAllowed(f"settings file unreadable or invalid: {exc}") from None
+            if settings_fingerprint(on_disk) != running:
+                raise LiveTradingNotAllowed(
+                    "settings changed on disk since this process started; restart (and re-arm) "
+                    "to apply them"
+                )
         check_live_gate(settings, kill, clock.now_ms())
         if clock.monotonic() - last_key_check < KEY_RECHECK_SECONDS:
             return
@@ -224,6 +249,7 @@ def build_live_app(
     http: httpx.Client | None = None,
     clock: Clock | None = None,
     store: Store | None = None,
+    reload_settings: Callable[[], Settings] | None = None,
 ) -> App:
     """Live trading. Raises LiveTradingNotAllowed unless every safety gate passes."""
     clock = clock or SystemClock()
@@ -264,6 +290,6 @@ def build_live_app(
         clock=clock,
         paper_broker=None,
         act_on_current_candle=False,
-        gate_check=make_gate_check(settings, kill, clock, client),
+        gate_check=make_gate_check(settings, kill, clock, client, reload_settings),
         lock=lock,
     )

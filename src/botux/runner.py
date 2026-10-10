@@ -18,7 +18,7 @@ from botux.clock import Clock
 from botux.config import SUPPORTED_INTERVALS, Settings
 from botux.data.market import fetch_latest_closed, fetch_quote, validate_live_candles
 from botux.decimals import ZERO
-from botux.errors import LiveTradingNotAllowed
+from botux.errors import ConfigError, ExchangeError, LiveTradingNotAllowed, StorageError
 from botux.exchange.client import BinanceSpotClient
 from botux.exchange.rules import SymbolRules
 from botux.execution.broker import Broker
@@ -26,6 +26,7 @@ from botux.execution.order_manager import OrderIntent, OrderManager, SubmitResul
 from botux.execution.paper import PaperBroker
 from botux.execution.positions import PositionBook
 from botux.killswitch import KillSwitch
+from botux.ledger import Ledger, LedgerView, balance_discrepancy, owned_base
 from botux.models import Balance, Candle, Fill, OrderType, Quote, Side
 from botux.risk.manager import PortfolioView, RiskManager
 from botux.storage import OrderRecord, Store
@@ -34,6 +35,10 @@ from botux.strategy.base import Signal, Strategy
 log = logging.getLogger(__name__)
 
 DAY_MS = 86_400_000
+ACK_KEY = "ack:balances"  # set by `botux ack-balances`, consumed by the loop
+ACK_DAILY_KEY = "ack:daily_loss"  # set by `botux reset-daily-loss`, consumed by the loop
+BLOCKERS_KEY = "entry_blockers"  # JSON, for `botux status`
+QUOTE_TOLERANCE = Decimal("0.01")
 
 
 class MarketFeed(Protocol):
@@ -103,6 +108,7 @@ class TradingLoop:
         self._stop_requested = False
         self._kill_handled = False
         self._gate_closed = False
+        order_manager.set_entry_guard(self._entry_guard)
         self._halt_alerted_day: int | None = None
         self._alerted_at: dict[str, float] = {}
         self._retries: dict[tuple[str, int], int] = {}
@@ -113,6 +119,27 @@ class TradingLoop:
         raw = store.kv_get("risk_state")
         if raw:
             risk.restore_state(json.loads(raw))
+        if not store.integrity_ok():
+            raise StorageError("the database failed its integrity check; refusing to start")
+        capital = settings.bot_capital
+        if capital is None:
+            raise ConfigError(
+                "risk.bot_capital must be set: the bot never treats the whole account as its own"
+            )
+        self._ledger = Ledger(
+            store,
+            rules,
+            capital=capital,
+            fee_rate=settings.execution.fee_rate,
+        )
+        if self._ledger.capital_changed_from is not None:
+            store.log_event(
+                clock.now_ms(),
+                "WARNING",
+                "capital_changed",
+                {"from": str(self._ledger.capital_changed_from), "to": str(capital)},
+            )
+            risk.rebase_day_start()
 
     @property
     def order_manager(self) -> OrderManager:
@@ -228,10 +255,11 @@ class TradingLoop:
                 self._notifier.notify("CRITICAL", "Trading halted", reason + suffix)
 
     def _check_gate(self) -> None:
-        """Re-verify the live gate every cycle (arming expiry, disarm, settings drift, key rights).
+        """Re-verify the live gate (arming expiry, disarm, settings drift, key rights).
 
         A closed gate halts NEW entries for good (until restart); exits stay possible so that
-        existing positions can still be protected.
+        existing positions can still be protected. Called every cycle AND right before every new
+        order (see :meth:`_entry_guard`).
         """
         if self._gate_check is None or self._gate_closed:
             return
@@ -246,6 +274,14 @@ class TradingLoop:
                 f"{exc}. New entries are halted; exits still work. Run 'botux kill' to stop "
                 "completely, or re-arm and restart.",
             )
+
+    def _entry_guard(self, intent: OrderIntent) -> str | None:
+        """Last-moment veto for any NEW order: gate and risk state are looked at again NOW."""
+        self._check_gate()
+        if self._gate_closed:
+            return self._risk.hard_halt_reason or "live gate closed"
+        ok, why = self._risk.entries_allowed()
+        return None if ok else why
 
     def _on_kill(self) -> None:
         """Emergency stop: cancel open orders, optionally flatten, then stop for good."""
@@ -312,17 +348,8 @@ class TradingLoop:
     def _now(self) -> int:
         return self._feed.now_ms()
 
-    def _position_qty(self, symbol: str, balances: Mapping[str, Balance]) -> Decimal:
-        """Sellable amount that belongs to the bot.
-
-        The baseline (free + locked amount of the base asset at first start) is never touched, so
-        coins the user already owned, including coins locked in the user's own orders, are not
-        the bot's to sell. Only FREE coins can be sold.
-        """
-        base = self._rules[symbol].base_asset
-        bal = balances.get(base)
-        free = bal.free if bal is not None else ZERO
-        total = bal.total if bal is not None else ZERO
+    def _baseline_for(self, base: str, total: Decimal) -> Decimal:
+        """Holding of ``base`` when the bot first looked at the account (free + locked)."""
         if base not in self._baseline:
             stored = self._store.kv_get(f"baseline:{base}")
             if stored is None:
@@ -330,21 +357,162 @@ class TradingLoop:
                 self._baseline[base] = total
             else:
                 self._baseline[base] = Decimal(stored)
-        return max(ZERO, min(free, total - self._baseline[base]))
+        return self._baseline[base]
+
+    def _owned(
+        self, symbol: str, balances: Mapping[str, Balance], view: LedgerView | None = None
+    ) -> tuple[Decimal, Decimal]:
+        """(base amount that is the bot's, part of it that is free to sell).
+
+        The bot's share is what ITS OWN fills explain (the ledger), further capped by what is
+        really on the account above the baseline (coins the user already held, including coins
+        locked in the user's own orders, are never the bot's to sell).
+        """
+        base = self._rules[symbol].base_asset
+        bal = balances.get(base)
+        free = bal.free if bal is not None else ZERO
+        total = bal.total if bal is not None else ZERO
+        led = view if view is not None else self._ledger.view()
+        owned = owned_base(
+            total, self._baseline_for(base, total), led.base_qty(symbol), self._ledger.offset(base)
+        )
+        return owned, min(free, owned)
+
+    def _position_qty(self, symbol: str, balances: Mapping[str, Balance]) -> Decimal:
+        """Sellable amount that belongs to the bot (only FREE coins can be sold)."""
+        return self._owned(symbol, balances)[1]
+
+    def _block(self, key: str, reason: str, *, alert: str | None = None) -> None:
+        """Block new entries (exits stay possible) while ``reason`` holds."""
+        if self._risk.set_blocker(key, reason):
+            log.warning("entries blocked [%s]: %s", key, reason)
+            self._store.log_event(self._now(), "CRITICAL", "entries_blocked", {key: reason})
+        if alert is not None:
+            self._alert_throttled(f"block:{key}", "CRITICAL", alert, reason)
+
+    def _unblock(self, key: str) -> None:
+        if self._risk.clear_blocker(key):
+            log.warning("entries unblocked [%s]", key)
+            self._store.log_event(self._now(), "INFO", "entries_unblocked", {"key": key})
+
+    def _check_ownership(self, balances: Mapping[str, Balance], led: LedgerView) -> Decimal:
+        """Compare real balances with what the bot's own fills explain.
+
+        Returns the bot's cash (ledger cash, reduced by any acknowledged quote deficit). Any
+        unexplained difference (a deposit, a withdrawal, a manual trade, a fill we never
+        recorded) blocks NEW entries until a human has looked and run ``botux ack-balances``.
+        Nothing is ever sold or cancelled because of a mismatch.
+        """
+        ack = bool(self._store.kv_get(ACK_KEY))
+        quote_asset = self._s.risk.quote_asset
+        fee = self._s.execution.fee_rate
+        settled = not self._om.uncertain_orders()  # unresolved orders explain mismatches
+        acknowledged: list[str] = []
+
+        for sym in self._s.market.symbols:
+            rules = self._rules[sym]
+            base = rules.base_asset
+            bal = balances.get(base)
+            total = bal.total if bal is not None else ZERO
+            offset = self._ledger.offset(base)
+            disc = balance_discrepancy(
+                total, self._baseline_for(base, total), led.base_qty(sym), offset
+            )
+            if ack and settled and disc != 0:
+                self._ledger.set_offset(base, offset + disc)
+                acknowledged.append(f"{base}: {disc:+f}")
+                disc = ZERO
+            if not settled:
+                continue
+            if abs(disc) > self._ledger.tolerance(sym, led):
+                self._block(
+                    f"balance:{base}",
+                    f"{base} on the account differs from the bot's own records by {disc:+f} "
+                    "(deposit, withdrawal, manual trade or an unrecorded fill?). Verify on the "
+                    "exchange, then run 'botux ack-balances'. Nothing was sold or cancelled.",
+                    alert="Unexpected balance change",
+                )
+            else:
+                self._unblock(f"balance:{base}")
+
+        qbal = balances.get(quote_asset)
+        total_q = qbal.total if qbal is not None else ZERO
+        q_offset = self._ledger.offset(quote_asset)
+        cash = led.cash + min(ZERO, q_offset)
+        deficit = cash - total_q
+        if ack and settled and deficit > 0:
+            self._ledger.set_offset(quote_asset, q_offset - deficit)
+            acknowledged.append(f"{quote_asset}: {-deficit:+f}")
+            cash -= deficit
+            deficit = ZERO
+        if settled:
+            inexact = any(sl.inexact_qty > 0 for sl in led.symbols.values())
+            tol = QUOTE_TOLERANCE + (self._ledger.capital * fee * 2 if inexact else ZERO)
+            if deficit > tol:
+                self._block(
+                    f"balance:{quote_asset}",
+                    f"{quote_asset} on the account is {deficit:f} below the bot's own cash "
+                    "records (withdrawal, manual trade or an unrecorded fill?). Verify on the "
+                    "exchange, then run 'botux ack-balances' (the missing amount then counts as "
+                    "a loss of bot capital).",
+                    alert="Unexpected balance change",
+                )
+            else:
+                self._unblock(f"balance:{quote_asset}")
+        if ack and settled:
+            self._store.kv_set(ACK_KEY, "")
+            self._store.log_event(
+                self._now(), "WARNING", "balances_acknowledged", {"offsets": acknowledged}
+            )
+            self._notifier.notify(
+                "WARNING",
+                "Balances acknowledged",
+                "A human accepted the current balances: "
+                + (", ".join(acknowledged) or "no change"),
+            )
+        return cash
+
+    def _check_open_orders(self) -> None:
+        """Entries stop while the exchange shows an open order that this bot did not place.
+
+        Foreign orders may hold funds or fill at any time; the bot cannot tell whether they are
+        the user's own or a leftover of a lost record, so it does not touch them (no cancel) and
+        simply does not trade until they are gone.
+        """
+        for sym in self._s.market.symbols:
+            key = f"orders:{sym}"
+            try:
+                live_orders = self._broker.open_orders(sym)
+            except ExchangeError as exc:
+                self._block(key, f"could not list open orders for {sym}: {type(exc).__name__}")
+                continue
+            foreign = [o for o in live_orders if self._store.get_order(o.client_order_id) is None]
+            if foreign:
+                ids = ", ".join(o.client_order_id[:12] for o in foreign[:5])
+                self._block(
+                    key,
+                    f"{len(foreign)} open order(s) on {sym} were not placed by this bot "
+                    f"({ids}). They are left untouched; trading on {sym} resumes when they are "
+                    "gone and balances are acknowledged.",
+                    alert="Foreign open order",
+                )
+            else:
+                self._unblock(key)
 
     def _snapshot(self, quotes: Mapping[str, Quote]) -> tuple[Decimal, PortfolioView]:
         balances = self._broker.balances()
         quote_asset = self._s.risk.quote_asset
         qbal = balances.get(quote_asset)
-        free_quote = ZERO if qbal is None else qbal.free
-        equity = ZERO if qbal is None else qbal.total
+        account_free = ZERO if qbal is None else qbal.free
+        led = self._ledger.view()
+        cash = self._check_ownership(balances, led)
+        free_quote = max(ZERO, min(cash, account_free))
+        equity = cash  # the BOT's equity: its own cash plus the coins its own fills explain
         notional: dict[str, Decimal] = {}
         qty: dict[str, Decimal] = {}
         for sym in self._s.market.symbols:
-            base = self._rules[sym].base_asset
-            qty[sym] = self._position_qty(sym, balances)  # also records the baseline once
-            bal = balances.get(base)
-            owned_total = max(ZERO, (bal.total if bal else ZERO) - self._baseline[base])
+            owned_total, sellable = self._owned(sym, balances, led)
+            qty[sym] = sellable
             notional[sym] = owned_total * quotes[sym].mid
             equity += notional[sym]
         self._last_positions = dict(qty)
@@ -358,12 +526,26 @@ class TradingLoop:
             open_orders=open_orders,
             orders_today=self._store.count_orders_since(day_start),
         )
+        self._persist_blockers()
         return equity, view
+
+    def _persist_blockers(self) -> None:
+        raw = json.dumps(self._risk.blockers, sort_keys=True)
+        if self._store.kv_get(BLOCKERS_KEY) != raw:
+            self._store.kv_set(BLOCKERS_KEY, raw)
 
     # ------------------------------------------------------------------ the cycle
 
+    def _health_probe(self, now: int) -> None:
+        """The write-ahead log must be writable before any order is considered."""
+        try:
+            self._store.kv_set("health:ts", str(now))
+        except Exception as exc:
+            raise StorageError(f"database is not writable ({type(exc).__name__})") from None
+
     def _cycle(self) -> None:
         now = self._now()
+        self._health_probe(now)
         self._om.reconcile_pending()
 
         quotes: dict[str, Quote] = {}
@@ -372,8 +554,10 @@ class TradingLoop:
             if self._paper is not None:
                 self._paper.set_quote(quotes[sym])
 
+        self._check_open_orders()
         equity, view = self._snapshot(quotes)
         self._risk.update_equity(now, equity)
+        self._apply_daily_loss_reset(equity)
         self._store.kv_set("risk_state", json.dumps(self._risk.export_state()))
         self._store.add_equity(now, equity, view.free_quote)
         day = now // DAY_MS
@@ -383,7 +567,8 @@ class TradingLoop:
                 "CRITICAL",
                 "Daily loss limit reached",
                 f"PnL today {self._risk.daily_pnl(equity):.2f} {self._s.risk.quote_asset}; "
-                "no new entries until the next UTC day.",
+                "no new entries until a human decides: 'botux reset-daily-loss' (this halt does "
+                "NOT end at midnight).",
             )
 
         errors: list[Exception] = []
@@ -414,6 +599,26 @@ class TradingLoop:
                 errors.append(exc)
         if errors:
             raise errors[0]
+
+    def _apply_daily_loss_reset(self, equity: Decimal) -> None:
+        """Consume a `botux reset-daily-loss` request (a human decision, never automatic)."""
+        if not self._store.kv_get(ACK_DAILY_KEY):
+            return
+        self._store.kv_set(ACK_DAILY_KEY, "")
+        lifted = self._risk.reset_daily_loss(equity)
+        self._halt_alerted_day = None
+        self._store.log_event(
+            self._now(),
+            "WARNING",
+            "daily_loss_reset",
+            {"lifted": lifted, "new_reference_equity": str(equity)},
+        )
+        self._notifier.notify(
+            "WARNING",
+            "Daily loss limit reset by a human",
+            f"{'Halt lifted' if lifted else 'No halt was active'}; the new daily reference is "
+            f"{equity:.2f} {self._s.risk.quote_asset}.",
+        )
 
     def _in_position(self, sym: str, view: PortfolioView) -> tuple[Decimal, bool]:
         rules = self._rules[sym]
@@ -488,6 +693,19 @@ class TradingLoop:
     def _submit_entry(
         self, sym: str, rules: SymbolRules, quote: Quote, view: PortfolioView, last: Candle
     ) -> SubmitResult | None:
+        spread = (quote.ask - quote.bid) / quote.mid
+        if spread > self._s.risk.max_spread_pct:
+            log.warning(
+                "%s entry skipped: spread %.4f%% is wider than the limit", sym, spread * 100
+            )
+            self._alert_throttled(
+                f"spread:{sym}",
+                "WARNING",
+                "Entry skipped: wide spread",
+                f"{sym}: spread {spread:.3%} > max_spread_pct {self._s.risk.max_spread_pct:.3%}; "
+                "not entering on a thin or broken order book.",
+            )
+            return None
         sizing = self._risk.size_entry(rules, quote.ask, view, OrderType.MARKET)
         if sizing.quantity <= 0:
             log.info("%s entry skipped by risk sizing: %s", sym, "; ".join(sizing.reasons))

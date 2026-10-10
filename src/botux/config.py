@@ -101,6 +101,12 @@ class RiskSettings:
     min_notional_buffer: Decimal = Decimal("1.05")
     max_price_deviation_pct: Decimal = Decimal("0.02")
     flatten_on_kill: bool = False
+    # Quote-asset amount the bot may treat as ITS OWN capital. The rest of the account is never
+    # used for sizing, equity or the daily-loss limit. None = paper: the whole simulated balance;
+    # live: refused (the operator must choose the amount explicitly).
+    bot_capital: Decimal | None = None
+    # Abstain from NEW entries while (ask - bid) / mid is wider than this (illiquid / broken book).
+    max_spread_pct: Decimal = Decimal("0.005")
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +154,13 @@ class Settings:
     @property
     def interval_ms(self) -> int:
         return SUPPORTED_INTERVALS[self.market.interval]
+
+    @property
+    def bot_capital(self) -> Decimal | None:
+        """Capital the bot may use: explicit setting, or the whole simulated balance in paper."""
+        if self.risk.bot_capital is not None:
+            return self.risk.bot_capital
+        return self.paper.starting_balance if self.mode == "paper" else None
 
 
 # --------------------------------------------------------------------------------------
@@ -341,6 +354,8 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
         min_notional_buffer=_dec(r, "min_notional_buffer", d.min_notional_buffer),
         max_price_deviation_pct=_dec(r, "max_price_deviation_pct", d.max_price_deviation_pct),
         flatten_on_kill=_bool(r, "flatten_on_kill", d.flatten_on_kill),
+        bot_capital=_dec(r, "bot_capital", Decimal(0)) if "bot_capital" in r else None,
+        max_spread_pct=_dec(r, "max_spread_pct", d.max_spread_pct),
     )
     _validate_risk(risk, market.symbols)
 
@@ -371,6 +386,15 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
     paper = PaperSettings(starting_balance=_dec(p, "starting_balance", Decimal(1000)))
     if paper.starting_balance <= 0:
         raise ConfigError("paper.starting_balance must be > 0")
+    if (
+        risk.bot_capital is not None
+        and mode == "paper"
+        and risk.bot_capital > paper.starting_balance
+    ):
+        raise ConfigError(
+            "risk.bot_capital cannot exceed paper.starting_balance in paper mode "
+            "(the simulator does not own more than that)"
+        )
 
     # --- live ---
     lv = _section(raw, "live", {f.name for f in dataclasses.fields(LiveSettings)})
@@ -444,6 +468,16 @@ def _validate_risk(risk: RiskSettings, symbols: tuple[str, ...]) -> None:
         raise ConfigError("risk.min_notional_buffer must be >= 1")
     if not Decimal(0) < risk.max_price_deviation_pct <= Decimal("0.5"):
         raise ConfigError("risk.max_price_deviation_pct must be within (0, 0.5]")
+    if not Decimal(0) < risk.max_spread_pct <= Decimal("0.1"):
+        raise ConfigError("risk.max_spread_pct must be within (0, 0.1]")
+    if risk.bot_capital is not None:
+        if risk.bot_capital <= 0:
+            raise ConfigError("risk.bot_capital must be > 0")
+        if risk.max_daily_loss >= risk.bot_capital:
+            raise ConfigError(
+                "risk.max_daily_loss must be smaller than risk.bot_capital (a daily loss limit "
+                "equal to the whole capital would never protect anything)"
+            )
 
 
 def resolve_config_path(path: str | Path | None, env: Mapping[str, str] | None = None) -> Path:

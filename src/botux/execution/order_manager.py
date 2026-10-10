@@ -42,6 +42,8 @@ OPEN_STATUSES = (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
 UNCERTAIN_STATUSES = (OrderStatus.PENDING_SEND, OrderStatus.UNKNOWN)
 
 FillCallback = Callable[[OrderRecord, list[Fill]], None]
+# Asked right before every NEW (non-exit) order is written/sent; a returned string vetoes it.
+EntryGuard = Callable[["OrderIntent"], str | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +86,7 @@ class OrderManager:
         reconcile_interval_seconds: float = 5.0,
         notional_buffer: Decimal = Decimal("1.05"),
         on_fill: FillCallback | None = None,
+        entry_guard: EntryGuard | None = None,
     ) -> None:
         self._broker = broker
         self._store = store
@@ -95,6 +98,10 @@ class OrderManager:
         self._interval = reconcile_interval_seconds
         self._buffer = notional_buffer
         self._on_fill = on_fill
+        self._entry_guard = entry_guard
+
+    def set_entry_guard(self, guard: EntryGuard) -> None:
+        self._entry_guard = guard
 
     def set_fill_callback(self, callback: FillCallback) -> None:
         self._on_fill = callback
@@ -139,6 +146,10 @@ class OrderManager:
         now = self._clock.now_ms()
         if self._kill is not None and self._kill.is_set() and not intent.is_exit:
             return SubmitResult("blocked", None, "kill switch is set")
+        if self._entry_guard is not None and not intent.is_exit:
+            veto = self._entry_guard(intent)  # e.g. the live gate, evaluated at the last moment
+            if veto:
+                return SubmitResult("blocked", None, veto)
         blocked = self.is_symbol_blocked(intent.symbol, for_exit=intent.is_exit)
         if blocked:
             return SubmitResult("blocked", None, blocked)

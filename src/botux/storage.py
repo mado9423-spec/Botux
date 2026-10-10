@@ -132,6 +132,14 @@ class Store:
     def close(self) -> None:
         self._conn.close()
 
+    def integrity_ok(self) -> bool:
+        """SQLite's own quick consistency check ("ok" when the file is sound)."""
+        try:
+            row = self._conn.execute("PRAGMA quick_check").fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None and str(row[0]) == "ok"
+
     def claim_mode(self, mode: str) -> None:
         """Bind this database to one trading mode; refuse to be opened by the other one.
 
@@ -284,6 +292,27 @@ class Store:
                     for f in fills
                 ],
             )
+
+    def last_fill_id(self) -> int:
+        row = self._conn.execute("SELECT COALESCE(MAX(id), 0) AS n FROM fills").fetchone()
+        return int(row["n"])
+
+    def fill_rows_after(self, fill_id: int) -> list[tuple[str, Side, Fill]]:
+        """Every fill recorded after row ``fill_id`` (exclusive), oldest first."""
+        rows = self._conn.execute(
+            "SELECT o.symbol AS symbol, o.side AS side, f.price, f.quantity, f.commission,"
+            " f.commission_asset FROM fills f JOIN orders o ON o.client_order_id=f.client_order_id"
+            " WHERE f.id>? ORDER BY f.id",
+            (fill_id,),
+        ).fetchall()
+        return [
+            (
+                str(r["symbol"]),
+                Side(r["side"]),
+                Fill(D(r["price"]), D(r["quantity"]), D(r["commission"]), r["commission_asset"]),
+            )
+            for r in rows
+        ]
 
     def fills_for(self, client_order_id: str) -> list[Fill]:
         rows = self._conn.execute(

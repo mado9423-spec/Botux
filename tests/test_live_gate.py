@@ -62,7 +62,10 @@ GOOD_KEY = {
 
 def live(settings: Settings) -> Settings:
     return dataclasses.replace(
-        settings, mode="live", live=dataclasses.replace(settings.live, enabled=True)
+        settings,
+        mode="live",
+        live=dataclasses.replace(settings.live, enabled=True),
+        risk=dataclasses.replace(settings.risk, bot_capital=Decimal(500)),
     )
 
 

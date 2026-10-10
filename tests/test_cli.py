@@ -96,6 +96,8 @@ def test_arming_cannot_be_driven_from_a_pipe(
     # a perfectly valid live configuration ...
     Path(cfg_path).write_text(
         'mode = "live"\n'
+        "[risk]\n"
+        'bot_capital = "500"\n'
         "[paths]\n"
         f'kill_file = "{tmp_path / "KILL"}"\n'
         "[live]\n"
@@ -195,3 +197,39 @@ def test_backtest_command_end_to_end_from_csv(
     ):
         assert needle in out
     assert {r.url.path for r in ex.requests} == {"/api/v3/exchangeInfo"}
+
+
+def test_ack_balances_needs_an_explicit_confirmation_and_only_writes_bookkeeping(
+    cfg_path: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_http(*_a: object, **_k: object) -> None:
+        raise AssertionError("network used")
+
+    monkeypatch.setattr(httpx.Client, "request", no_http)
+    Store(tmp_path / "db-live.sqlite3").close()
+    assert main(["-c", cfg_path, "ack-balances"]) == 2  # no --confirm-checked
+    assert "--confirm-checked" in capsys.readouterr().err
+    s = Store(tmp_path / "db-live.sqlite3")
+    assert not s.kv_get("ack:balances")
+    s.close()
+    assert main(["-c", cfg_path, "ack-balances", "--confirm-checked"]) == 0
+    s = Store(tmp_path / "db-live.sqlite3")
+    assert s.kv_get("ack:balances")
+    assert [e["kind"] for e in s.events()] == ["ack_balances_requested"]
+    s.close()
+    assert "Nothing was sent to the exchange" in capsys.readouterr().out
+    assert main(["-c", cfg_path, "ack-balances", "--confirm-checked", "--mode", "paper"]) == 2
+
+
+def test_status_lists_why_new_entries_are_blocked(
+    cfg_path: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    s = Store(tmp_path / "db-live.sqlite3")
+    s.kv_set("entry_blockers", '{"balance:BTC": "BTC differs by +0.3"}')
+    s.close()
+    assert main(["-c", cfg_path, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "NEW ENTRIES BLOCKED [balance:BTC]: BTC differs by +0.3" in out
