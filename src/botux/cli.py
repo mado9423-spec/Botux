@@ -34,6 +34,7 @@ from botux.data.market import check_candles, fetch_range, load_csv, only_closed,
 from botux.errors import BotuxError
 from botux.exchange.client import BinanceSpotClient
 from botux.exchange.rules import SymbolRules
+from botux.execution.livecheck import run_live_check
 from botux.killswitch import KillSwitch
 from botux.models import Candle, OrderStatus
 from botux.safety import RISK_TEXT, arm_live_interactive, check_live_gate, disarm
@@ -340,6 +341,19 @@ def cmd_ack_balances(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_live_check(args: argparse.Namespace) -> int:
+    """Read-only rehearsal with the operator's own key; sends no order (see execution/livecheck)."""
+    if not args.confirm_contact_binance:
+        raise BotuxError(
+            "refusing without --confirm-contact-binance: this command contacts Binance with the "
+            "API key in your environment/.env (read-only calls plus POST /order/test, which "
+            "never reaches the matching engine). It sends no order."
+        )
+    s = _settings(args)
+    setup_logging()
+    return run_live_check(s, os.environ)
+
+
 def cmd_reset_daily_loss(args: argparse.Namespace) -> int:
     """Human decision to lift a tripped daily-loss halt (it does not end at midnight by itself)."""
     if not args.confirm_checked:
@@ -441,6 +455,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="I compared the account with the bot's records and accept the difference",
     )
     a.set_defaults(func=cmd_ack_balances)
+    lc = sub.add_parser(
+        "live-check",
+        help="read-only rehearsal with your own key (order/test only; sends NO order)",
+    )
+    lc.add_argument(
+        "--confirm-contact-binance",
+        action="store_true",
+        help="I understand this contacts Binance with the API key in my environment",
+    )
+    lc.set_defaults(func=cmd_live_check)
     d = sub.add_parser(
         "reset-daily-loss",
         help="lift a tripped daily-loss halt after finding out why (human decision)",

@@ -10,6 +10,8 @@ Fill model (deliberately pessimistic and simple):
   live is rejected here too.
 * Binance semantics are mimicked on purpose: an order id is rejected as a duplicate unless the
   previous order with that id was FILLED ("accepted only when the previous one is filled").
+* ``FillPlan`` makes the next orders fill only a fraction: a MARKET order that fills partially
+  ends EXPIRED with what it got (as on Binance); a LIMIT order stays PARTIALLY_FILLED and rests.
 * ``FaultPlan`` injects rejections, timeouts (executed or not) and outages so that the order
   manager's handling of uncertain outcomes can be exercised without a real exchange.
 """
@@ -59,6 +61,22 @@ class FaultPlan:
         return self._queue.popleft() if self._queue else None
 
 
+class FillPlan:
+    """FIFO queue of fill fractions (0 < f < 1) applied to the next orders that would fill."""
+
+    def __init__(self) -> None:
+        self._queue: deque[Decimal] = deque()
+
+    def push(self, fraction: Decimal | str, times: int = 1) -> None:
+        f = Decimal(fraction)
+        if not Decimal(0) <= f < Decimal(1):
+            raise ValueError("a partial-fill fraction must be within [0, 1)")
+        self._queue.extend([f] * times)
+
+    def pop(self) -> Decimal | None:
+        return self._queue.popleft() if self._queue else None
+
+
 class PaperBroker:
     def __init__(
         self,
@@ -77,6 +95,7 @@ class PaperBroker:
         self._slip = slippage_bps / Decimal(10_000)
         self._clock = clock or SystemClock()
         self.faults = faults or FaultPlan()
+        self.fill_plan = FillPlan()
         self._orders: dict[str, OrderResult] = {}
         self._quotes: dict[str, Quote] = {}
         self._next_id = 1
@@ -180,7 +199,11 @@ class PaperBroker:
 
         if marketable_price is not None:
             self._check_funds(rules, req.side, req.quantity, marketable_price)
-            self._settle(order, rules, marketable_price)
+            self._fill_part(order, rules, marketable_price)
+            if order.type is OrderType.MARKET and not order.status.is_terminal:
+                order.status = OrderStatus.EXPIRED  # a market order never rests: the rest lapses
+            elif order.status is not OrderStatus.FILLED:
+                self._lock(order, rules)  # a partly filled LIMIT keeps the rest on the book
         else:
             # resting LIMIT order: lock the funds it could consume
             assert req.price is not None
@@ -198,11 +221,12 @@ class PaperBroker:
             raise self._reject("Account has insufficient balance for requested action.", -2010)
 
     def _lock(self, order: OrderResult, rules: SymbolRules) -> None:
+        remaining = order.orig_qty - order.executed_qty
         if order.side is Side.BUY:
             assert order.price is not None
-            amount, asset = order.orig_qty * order.price, rules.quote_asset
+            amount, asset = remaining * order.price, rules.quote_asset
         else:
-            amount, asset = order.orig_qty, rules.base_asset
+            amount, asset = remaining, rules.base_asset
         self._free[asset] = self._free.get(asset, ZERO) - amount
         self._locked[asset] = self._locked.get(asset, ZERO) + amount
 
@@ -217,9 +241,18 @@ class PaperBroker:
         self._locked[asset] = self._locked.get(asset, ZERO) - amount
         self._free[asset] = self._free.get(asset, ZERO) + amount
 
-    def _settle(self, order: OrderResult, rules: SymbolRules, price: Decimal) -> None:
-        """Apply a full fill at ``price`` (funds must be free, not locked)."""
-        qty = order.orig_qty - order.executed_qty
+    def _fill_part(self, order: OrderResult, rules: SymbolRules, price: Decimal) -> None:
+        """Fill the order (or the next planned fraction of what is left) at ``price``."""
+        remaining = order.orig_qty - order.executed_qty
+        fraction = self.fill_plan.pop()
+        qty = (
+            remaining if fraction is None else floor_to_step(remaining * fraction, rules.step_size)
+        )
+        if qty > 0:
+            self._settle(order, rules, price, qty)
+
+    def _settle(self, order: OrderResult, rules: SymbolRules, price: Decimal, qty: Decimal) -> None:
+        """Apply a fill of ``qty`` at ``price`` (funds must be free, not locked)."""
         notional = qty * price
         if order.side is Side.BUY:
             fee = (qty * self._fee).quantize(_COMMISSION_PRECISION, rounding=ROUND_CEILING)
@@ -234,7 +267,11 @@ class PaperBroker:
         order.fills.append(Fill(price, qty, fee, fee_asset))
         order.executed_qty += qty
         order.cumulative_quote_qty += notional
-        order.status = OrderStatus.FILLED
+        order.status = (
+            OrderStatus.FILLED
+            if order.executed_qty >= order.orig_qty
+            else OrderStatus.PARTIALLY_FILLED
+        )
         order.transact_time_ms = self._clock.now_ms()
 
     def _match_resting(self, symbol: str) -> None:
@@ -255,4 +292,6 @@ class PaperBroker:
             )
             if crosses:
                 self._unlock(order)
-                self._settle(order, rules, order.price)
+                self._fill_part(order, rules, order.price)
+                if not order.status.is_terminal:
+                    self._lock(order, rules)  # still partly open: keep the remainder on the book

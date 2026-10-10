@@ -121,7 +121,7 @@ class TestAllowList:
             assert not any(word in ep.path.lower() for word in forbidden), ep
             assert ep.method in {"GET", "POST", "DELETE"}
             if ep.method != "GET":
-                assert ep.path in {"/api/v3/order", "/api/v3/order/test", "/api/v3/openOrders"}
+                assert ep.path in {"/api/v3/order", "/api/v3/order/test"}
         sapi = [ep.path for ep in ENDPOINTS.values() if ep.path.startswith("/sapi")]
         assert sapi == ["/sapi/v1/account/apiRestrictions"]  # the read-only permission check
 
@@ -149,7 +149,7 @@ class TestAllowList:
         with pytest.raises(EndpointNotAllowed):
             c.cancel_order("BTCUSDT", client_order_id="x")
         with pytest.raises(EndpointNotAllowed):
-            c.cancel_open_orders("BTCUSDT")
+            c.test_order(**order_kwargs())  # type: ignore[arg-type]
         assert ex.requests == []
 
     def test_trading_flag_requires_credentials(self, clock: FakeClock) -> None:

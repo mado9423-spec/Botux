@@ -115,15 +115,6 @@ ENDPOINTS: dict[str, Endpoint] = dict(
         _ep("test_order", "POST", "/api/v3/order/test", Security.TRADE, 1, retry=False),
         _ep("new_order", "POST", "/api/v3/order", Security.TRADE, 1, retry=False, state=True),
         _ep("cancel_order", "DELETE", "/api/v3/order", Security.TRADE, 1, retry=True, state=True),
-        _ep(
-            "cancel_open_orders",
-            "DELETE",
-            "/api/v3/openOrders",
-            Security.TRADE,
-            1,
-            retry=True,
-            state=True,
-        ),
     ]
 )
 
@@ -181,6 +172,7 @@ class BinanceSpotClient:
         trading_base_url: str = "https://api.binance.com",
         credentials: Credentials | None = None,
         trading_enabled: bool = False,
+        order_test_enabled: bool = False,
         http: httpx.Client | None = None,
         clock: Clock | None = None,
         recv_window_ms: int = 5000,
@@ -198,12 +190,13 @@ class BinanceSpotClient:
                 raise ConfigError(f"{what} base URL {url!r} is not an allow-listed https host")
         if recv_window_ms > 5000 or recv_window_ms < 500:
             raise ConfigError("recv_window_ms must be within [500, 5000] (Binance advises <= 5000)")
-        if trading_enabled and credentials is None:
-            raise ConfigError("trading_enabled requires credentials")
+        if (trading_enabled or order_test_enabled) and credentials is None:
+            raise ConfigError("trading_enabled / order_test_enabled require credentials")
         self._md_base = market_data_base_url.rstrip("/")
         self._tr_base = trading_base_url.rstrip("/")
         self._credentials = credentials
         self._trading_enabled = trading_enabled
+        self._order_test_enabled = order_test_enabled
         self._http = http or httpx.Client(
             timeout=httpx.Timeout(15.0, connect=5.0),
             follow_redirects=False,
@@ -232,6 +225,10 @@ class BinanceSpotClient:
         return self._trading_enabled
 
     @property
+    def order_test_enabled(self) -> bool:
+        return self._order_test_enabled
+
+    @property
     def clock_offset_ms(self) -> int:
         return self._offset_ms
 
@@ -243,7 +240,9 @@ class BinanceSpotClient:
     def _check_allowed(self, ep: Endpoint) -> None:
         if ep.security is not Security.NONE and self._credentials is None:
             raise EndpointNotAllowed(f"{ep.name}: signed endpoints are disabled (no credentials)")
-        if ep.security is Security.TRADE and not self._trading_enabled:
+        # POST /order/test never reaches the matching engine, so it may be enabled on its own
+        test_only = ep.name == "test_order" and self._order_test_enabled
+        if ep.security is Security.TRADE and not (self._trading_enabled or test_only):
             raise EndpointNotAllowed(f"{ep.name}: trading is not enabled on this client")
 
     def _check_cooldown(self) -> None:
@@ -510,28 +509,70 @@ class BinanceSpotClient:
         time_in_force: str = "GTC",
     ) -> dict[str, Any]:
         """POST /api/v3/order. Never retried; may raise :class:`OutcomeUnknownError`."""
-        params: dict[str, Any] = {
-            "symbol": symbol,
-            "side": side,
-            "type": order_type,
-            "quantity": quantity,
-            "newClientOrderId": client_order_id,
-            "newOrderRespType": "FULL",
-        }
-        if order_type == "LIMIT":
-            if price is None:
-                raise ValueError("LIMIT order requires a price")
-            params["price"] = price
-            params["timeInForce"] = time_in_force
-        return dict(self._call("new_order", params))
+        return dict(
+            self._call(
+                "new_order",
+                _order_params(
+                    symbol, side, order_type, quantity, price, client_order_id, time_in_force
+                ),
+            )
+        )
+
+    def test_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        price: Decimal | None = None,
+        client_order_id: str,
+        time_in_force: str = "GTC",
+    ) -> dict[str, Any]:
+        """POST /api/v3/order/test: validates the request, signature and permissions only.
+
+        The order is NOT sent to the matching engine, so a success proves nothing about
+        execution, fills, liquidity or the strategy. Needs a client built with
+        ``order_test_enabled`` (or ``trading_enabled``).
+        """
+        return dict(
+            self._call(
+                "test_order",
+                _order_params(
+                    symbol, side, order_type, quantity, price, client_order_id, time_in_force
+                ),
+            )
+        )
 
     def cancel_order(self, symbol: str, *, client_order_id: str) -> dict[str, Any]:
         return dict(
             self._call("cancel_order", {"symbol": symbol, "origClientOrderId": client_order_id})
         )
 
-    def cancel_open_orders(self, symbol: str) -> list[dict[str, Any]]:
-        return list(self._call("cancel_open_orders", {"symbol": symbol}))
+
+def _order_params(
+    symbol: str,
+    side: str,
+    order_type: str,
+    quantity: Decimal,
+    price: Decimal | None,
+    client_order_id: str,
+    time_in_force: str,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "quantity": quantity,
+        "newClientOrderId": client_order_id,
+        "newOrderRespType": "FULL",
+    }
+    if order_type == "LIMIT":
+        if price is None:
+            raise ValueError("LIMIT order requires a price")
+        params["price"] = price
+        params["timeInForce"] = time_in_force
+    return params
 
 
 class _ServerError(ExchangeError):
