@@ -109,6 +109,20 @@ class TestEngine:
         assert trade.pnl < 0 and trade.fees > 0
         assert trade.quantity * trade.entry_price <= D(100) + D("0.01")  # hard order cap respected
 
+    def test_accounting_matches_a_hand_calculation(self, rules: SymbolRules) -> None:
+        """Slippage off, fee 0.1% (BUY fee in BTC, SELL fee in USDT), all by hand:
+
+        entry   price 101.00, qty = min(risk 2.475, cap 100/101) -> 0.99009  (cost 99.99909)
+        buy fee 0.99009 * 0.001 = 0.00099009 BTC  -> holds 0.98909991, sellable 0.98909
+        exit    price 100.00 -> proceeds 98.909, sell fee 0.098909 USDT
+        pnl     98.909 - 0.098909 - 99.99909 = -1.188999
+        """
+        (trade,) = run(candles_from_closes(SCENARIO), rules, slip="0").trades
+        assert trade.entry_price == D("101.00") and trade.exit_price == D("100.00")
+        assert trade.quantity == D("0.98909")
+        assert trade.pnl == D("-1.188999")
+        assert trade.fees == D("0.00099009") * D("101.00") + D("0.098909")
+
     def test_costs_lower_the_result(self, rules: SymbolRules) -> None:
         c = candles_from_closes(SCENARIO)
         free = run(c, rules, fee="0", slip="0")

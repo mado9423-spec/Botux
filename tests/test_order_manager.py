@@ -255,3 +255,48 @@ class TestKillSwitchInteraction:
         assert env.om.cancel_all_open() == 1
         assert env.om.open_orders() == []
         assert env.broker.balances()["USDT"].free == D(1000)
+
+
+class TestFillBookkeeping:
+    def test_applying_the_same_full_result_twice_records_fills_once(self, env: Env) -> None:
+        r = env.om.submit(buy())
+        assert r.record is not None
+        result = env.broker.get_order("BTCUSDT", r.record.client_order_id)
+        assert result is not None
+        for _ in range(3):
+            env.om._apply(r.record, result)
+        assert len(env.store.fills_for(r.record.client_order_id)) == 1
+        assert len(env.fills) == 1
+
+    def test_totals_only_updates_become_incremental_estimated_fills(self, env: Env) -> None:
+        """A live GET /order has no fills list: partial progress is turned into deltas."""
+        rec = OrderRecord(
+            "c1",
+            "k",
+            "BTCUSDT",
+            Side.BUY,
+            OrderType.LIMIT,
+            D("1"),
+            D("100"),
+            OrderStatus.NEW,
+            0,
+            0,
+        )
+        assert env.store.insert_order(rec)
+
+        def snapshot(executed: str, quote: str, status: OrderStatus) -> OrderResult:
+            return OrderResult(
+                "c1", "BTCUSDT", Side.BUY, OrderType.LIMIT, status, D("1"), D(executed), D(quote)
+            )
+
+        env.om._apply(rec, snapshot("0.4", "40", OrderStatus.PARTIALLY_FILLED))
+        env.om._apply(rec, snapshot("0.4", "40", OrderStatus.PARTIALLY_FILLED))  # no progress
+        env.om._apply(rec, snapshot("1", "101", OrderStatus.FILLED))
+        fills = env.store.fills_for("c1")
+        # second delta: 0.6 BTC for 61 USDT (101 - 40 cumulative)
+        assert [(f.quantity, f.price) for f in fills] == [
+            (D("0.4"), D("100")),
+            (D("0.6"), D("61") / D("0.6")),
+        ]
+        assert sum((f.quantity for f in fills), D(0)) == D("1")
+        assert len(env.fills) == 2

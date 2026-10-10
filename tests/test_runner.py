@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from botux.execution.paper import FaultKind
 from botux.killswitch import KillSwitch
 from botux.models import Candle, OrderStatus, OrderType, Quote, Side
 from botux.storage import OrderRecord, Store
+from botux.strategy.base import Signal
 from tests.conftest import HOUR_MS, T0, FakeExchange, candles_from_closes
 
 D = Decimal
@@ -178,6 +180,27 @@ class TestSignalsToOrders:
         for _ in range(4):
             h.cycle()  # same closed candle polled repeatedly
         assert len(h.orders()) == 1
+
+    def test_strategy_is_evaluated_once_per_closed_candle(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store, closed=5, act_current=True)
+        calls: list[int] = []
+        inner = h.loop._strategy
+
+        class Counting:
+            name = inner.name
+            warmup = inner.warmup
+
+            def on_candles(self, candles: Sequence[Candle], in_position: bool) -> Signal:
+                calls.append(candles[-1].open_time_ms)
+                return inner.on_candles(candles, in_position)
+
+        h.loop._strategy = Counting()
+        for _ in range(5):
+            h.cycle()  # the same candle polled again and again
+        h.cycle(hours=1)  # a new candle closes
+        assert calls == [h.candles[4].open_time_ms, h.candles[5].open_time_ms]
 
     def test_stop_loss_exits_when_the_bid_falls_through_the_stop(
         self, cfg: Settings, rules: SymbolRules, store: Store

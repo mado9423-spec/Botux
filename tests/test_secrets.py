@@ -44,6 +44,15 @@ class TestRedactor:
         out = r.scrub(f"GET /api/v3/account?timestamp=1&signature={sig} X-MBX-APIKEY: abcdef123456")
         assert sig not in out and "abcdef123456" not in out and REDACTED in out
 
+    @pytest.mark.parametrize(
+        "sig",
+        ["Zm9vYmFy0123456789+/abcd==", "abcdef0123456789abcdef", "A%2Bb%2Fc0123456789xyzXYZ%3D"],
+    )
+    def test_non_hmac_signatures_of_any_length_are_redacted(self, sig: str) -> None:
+        # RSA / Ed25519 signatures are base64 and need not be 64 characters long.
+        out = Redactor().scrub(f"POST body: symbol=BTCUSDT&timestamp=1&signature={sig}")
+        assert sig not in out and "signature=" in out
+
     def test_generic_secret_assignments(self) -> None:
         r = Redactor()
         for text in (

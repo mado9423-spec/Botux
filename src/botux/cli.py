@@ -18,7 +18,7 @@ from pathlib import Path
 from types import FrameType
 
 from botux import __version__
-from botux.app import App, build_live_app, build_paper_app, load_rules, public_client
+from botux.app import App, build_live_app, build_paper_app, public_client
 from botux.backtest.metrics import format_metrics
 from botux.backtest.study import run_study
 from botux.clock import SystemClock
@@ -31,8 +31,10 @@ from botux.config import (
 )
 from botux.data.market import check_candles, fetch_range, load_csv, only_closed, save_csv
 from botux.errors import BotuxError
+from botux.exchange.client import BinanceSpotClient
+from botux.exchange.rules import SymbolRules
 from botux.killswitch import KillSwitch
-from botux.models import OrderStatus
+from botux.models import Candle, OrderStatus
 from botux.safety import RISK_TEXT, arm_live_interactive, check_live_gate, disarm
 from botux.secrets_guard import setup_logging
 from botux.storage import Store
@@ -91,7 +93,9 @@ def cmd_fetch_data(args: argparse.Namespace) -> int:
     return 0
 
 
-def _download(client, symbol: str, interval: str, days: int, now_ms: int):  # type: ignore[no-untyped-def]
+def _download(
+    client: BinanceSpotClient, symbol: str, interval: str, days: int, now_ms: int
+) -> list[Candle]:
     start = now_ms - days * 86_400_000
     candles = only_closed(fetch_range(client, symbol, interval, start, now_ms), now_ms)
     report = check_candles(candles, SUPPORTED_INTERVALS[interval])
@@ -117,11 +121,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     report_data = check_candles(candles, interval_ms)
     if report_data.fatal:
         raise BotuxError(f"data problems: {report_data.describe()}")
-    rules = load_rules(client, s)[symbol] if symbol in s.market.symbols else None
-    if rules is None:
-        from botux.exchange.rules import SymbolRules
-
-        rules = SymbolRules.from_exchange_info(client.exchange_info(symbol), symbol)
+    rules = SymbolRules.from_exchange_info(client.exchange_info(symbol), symbol)
 
     grid = DEFAULT_GRIDS.get(s.strategy.name, {})
     study = run_study(
