@@ -187,6 +187,17 @@ class TestRepositoryHygiene:
     def test_templates_and_sources_are_not_ignored(self, path: str) -> None:
         assert _git("check-ignore", "-q", path).returncode == 1
 
+    def test_no_source_or_test_file_is_git_ignored(self) -> None:
+        """A too-greedy ignore pattern (e.g. 'data/') once hid the src/botux/data package."""
+        files = [
+            str(p.relative_to(ROOT))
+            for folder in ("src", "tests")
+            for p in (ROOT / folder).rglob("*.py")
+        ]
+        assert files, "no sources found"
+        ignored = [f for f in files if _git("check-ignore", "-q", f).returncode == 0]
+        assert ignored == []
+
     def test_no_secret_shaped_content_in_any_non_ignored_file(self) -> None:
         listing = _git("ls-files", "--cached", "--others", "--exclude-standard").stdout.split("\n")
         token = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{64}(?![A-Za-z0-9])")
