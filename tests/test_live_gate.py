@@ -206,6 +206,28 @@ class TestGateRefusals:
             check_live_gate(s, kill_for(s, clock), clock.now_ms())
 
 
+class TestArmingFileTypes:
+    @pytest.mark.parametrize("armed_at", ["soon", None, True, 1.5, [1]])
+    def test_a_bad_timestamp_is_a_clean_refusal_not_a_crash(
+        self, armed_at: object, settings: Settings, clock: FakeClock
+    ) -> None:
+        s = live(settings)
+        path = arm(s, clock)
+        data = json.loads(path.read_text())
+        data["armed_at_ms"] = armed_at
+        path.write_text(json.dumps(data))
+        with pytest.raises(LiveTradingNotAllowed, match="invalid timestamp"):
+            check_live_gate(s, kill_for(s, clock), clock.now_ms())
+
+    def test_kill_file_content_does_not_matter(self, settings: Settings, clock: FakeClock) -> None:
+        s = live(settings)
+        arm(s, clock)
+        for content in ("1", "null", "[]", '"x"', "{", ""):
+            Path(s.paths.kill_file).write_text(content)
+            with pytest.raises(LiveTradingNotAllowed, match="kill switch"):
+                check_live_gate(s, kill_for(s, clock), clock.now_ms())
+
+
 class TestArmingCommand:
     def test_wrong_phrase_does_not_arm(self, settings: Settings, clock: FakeClock) -> None:
         s = live(settings)

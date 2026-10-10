@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import tomllib
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 
@@ -11,8 +12,10 @@ import pytest
 
 from botux.config import (
     LiveSettings,
+    PaperSettings,
     PathSettings,
     Settings,
+    database_path,
     load_credentials,
     load_settings,
     parse_settings,
@@ -88,6 +91,23 @@ class TestValidation:
             ("[live]\narm_max_age_hours = 0", "arm_max_age_hours"),
             ("[live]\nmax_clock_skew_ms = 50", "max_clock_skew_ms"),
             ("[live]\nenabled = 1", "true or false"),
+            ("[market]\npoll_seconds = nan", "finite"),
+            ("[market]\npoll_seconds = inf", "finite"),
+            ("[market]\npoll_seconds = 1e12", "finite"),
+            ("[market]\nmax_candle_age_factor = nan", "finite"),
+            ("[execution]\nreconcile_interval_seconds = inf", "finite"),
+            ("[live]\narm_max_age_hours = nan", "finite"),
+            ('[market]\nsymbols = ["BTCUSDT\\n"]', "invalid symbol"),
+            ('[risk]\nquote_asset = "USDT\\n"', "quote_asset"),
+            ('[market]\ntrading_base_url = "https://api.binance.com:8443"', "bare origin"),
+            ('[market]\ntrading_base_url = "https://api.binance.com/#frag"', "bare origin"),
+            (
+                '[market]\nmarket_data_base_url = "https://data-api.binance.vision:444"',
+                "bare origin",
+            ),
+            ('[paths]\nkill_file = ""', "must not be empty"),
+            ('[paths]\ndatabase = "  "', "must not be empty"),
+            ('[live]\narm_file = ""', "must not be empty"),
         ],
     )
     def test_bad_values_are_rejected(self, toml: str, message: str) -> None:
@@ -130,12 +150,47 @@ class TestFingerprint:
             a
         )
 
-    def test_ignores_local_file_locations(self) -> None:
+    @pytest.mark.parametrize(
+        "change",
+        [
+            lambda a: dataclasses.replace(a, paths=PathSettings(kill_file="/elsewhere/KILL")),
+            lambda a: dataclasses.replace(a, paths=PathSettings(database="/elsewhere/db.sqlite3")),
+            lambda a: dataclasses.replace(a, live=LiveSettings(arm_file="/elsewhere/armed.json")),
+            lambda a: dataclasses.replace(a, live=LiveSettings(arm_max_age_hours=168.0)),
+        ],
+    )
+    def test_safety_relevant_locations_and_lifetime_are_part_of_the_fingerprint(
+        self, change: Callable[[Settings], Settings]
+    ) -> None:
+        # Re-pointing the kill file (e.g. at a path nobody writes to) or lengthening the arming
+        # lifetime must invalidate an existing arming.
+        assert settings_fingerprint(change(Settings())) != settings_fingerprint(Settings())
+
+    def test_paper_only_settings_do_not_matter(self) -> None:
         a = Settings()
-        moved = dataclasses.replace(
-            a, paths=PathSettings(kill_file="/x/KILL"), live=LiveSettings(arm_file="/x/armed.json")
-        )
-        assert settings_fingerprint(moved) == settings_fingerprint(a)
+        b = dataclasses.replace(a, paper=PaperSettings(starting_balance=D(5)))
+        assert settings_fingerprint(a) == settings_fingerprint(b)
+
+
+class TestPaths:
+    def test_loaded_settings_use_absolute_paths_so_every_command_agrees(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_path / "c.toml"
+        cfg.write_text('[paths]\nkill_file = ".botux/KILL"\n[live]\narm_file = "armed.json"\n')
+        s = load_settings(cfg)
+        assert s.paths.kill_file == str(tmp_path / ".botux" / "KILL")
+        assert s.live.arm_file == str(tmp_path / "armed.json")
+        assert Path(s.paths.database).is_absolute()
+
+    def test_each_mode_has_its_own_database_file(self) -> None:
+        s = Settings()
+        assert database_path(s, "paper") != database_path(s, "live")
+        assert database_path(s, "paper").endswith("botux-paper.sqlite3")
+        assert database_path(s, "live").endswith("botux-live.sqlite3")
+        mem = dataclasses.replace(s, paths=PathSettings(database=":memory:"))
+        assert database_path(mem, "live") == ":memory:"
 
 
 class TestConfigPath:

@@ -188,6 +188,24 @@ class TestMetrics:
         assert 0 < m.exposure < 1
         assert "return" in format_metrics(m)
 
+    def test_buy_and_hold_baseline_uses_the_same_capital_as_the_strategy(
+        self, rules: SymbolRules
+    ) -> None:
+        c = candles_from_closes([100] * 5 + [110] * 10)  # +10% in total
+        res = run(c, rules)  # default caps: at most 100 of the 1000 start cash is deployed
+        assert res.buy_and_hold_return == pytest.approx(0.10)
+        assert res.buy_and_hold_same_capital == pytest.approx(0.01)  # 100/1000 of +10%
+        rich = run(
+            c,
+            rules,
+            risk=RiskSettings(
+                max_order_notional=D(5000),
+                max_position_notional=D(5000),
+                max_total_exposure=D(5000),
+            ),
+        )
+        assert rich.buy_and_hold_same_capital == pytest.approx(0.10)  # capped by the cash itself
+
     def test_no_trades_means_flat_equity(self, rules: SymbolRules) -> None:
         m = compute_metrics(run(candles_from_closes([100] * 20), rules))
         assert m.trades == 0 and m.total_return == 0 and m.sharpe is None

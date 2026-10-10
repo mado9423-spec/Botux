@@ -142,6 +142,16 @@ class TestLimitOrdersAndIds:
         with pytest.raises(OrderRejected, match="Duplicate order sent"):
             b.place_order(limit("dup", Side.BUY, "0.001", "59000.00"))
 
+    def test_id_of_a_cancelled_order_is_not_reusable(
+        self, rules: SymbolRules, clock: FakeClock
+    ) -> None:
+        # Binance: the same newClientOrderId is accepted ONLY when the previous order is filled.
+        b = broker(rules, clock)
+        b.place_order(limit("c1", Side.BUY, "0.001", "59000.00"))
+        b.cancel_order("BTCUSDT", "c1")
+        with pytest.raises(OrderRejected, match="Duplicate order sent"):
+            b.place_order(limit("c1", Side.BUY, "0.001", "59000.00"))
+
     def test_id_of_a_filled_order_is_accepted_again_like_binance(
         self, rules: SymbolRules, clock: FakeClock
     ) -> None:

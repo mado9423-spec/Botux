@@ -25,6 +25,7 @@ from botux.clock import SystemClock
 from botux.config import (
     SUPPORTED_INTERVALS,
     Settings,
+    database_path,
     load_settings,
     settings_fingerprint,
     settings_summary,
@@ -36,7 +37,7 @@ from botux.exchange.rules import SymbolRules
 from botux.killswitch import KillSwitch
 from botux.models import Candle, OrderStatus
 from botux.safety import RISK_TEXT, arm_live_interactive, check_live_gate, disarm
-from botux.secrets_guard import setup_logging
+from botux.secrets_guard import GLOBAL_REDACTOR, setup_logging
 from botux.storage import Store
 
 log = logging.getLogger("botux")
@@ -68,6 +69,9 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     print(json.dumps(settings_summary(s), indent=2, sort_keys=True))
     print(f"\nsettings fingerprint : {settings_fingerprint(s)}")
     print(f"mode                 : {s.mode}")
+    print(f"kill file            : {s.paths.kill_file}")
+    print(f"paper database       : {database_path(s, 'paper')}")
+    print(f"live database        : {database_path(s, 'live')}")
     kill = KillSwitch(s.paths.kill_file)
     try:
         check_live_gate(s, kill, SystemClock().now_ms())
@@ -229,7 +233,11 @@ def _print_summary(app: App, s: Settings) -> None:
 def cmd_kill(args: argparse.Namespace) -> int:
     s = _settings(args)
     KillSwitch(s.paths.kill_file).trip(args.reason)
-    print(f"kill switch SET ({s.paths.kill_file}). A running bot cancels open orders and stops.")
+    print(
+        f"kill switch SET: {s.paths.kill_file}\n"
+        "A bot using this same file cancels open orders and stops. Make sure it was started with "
+        "the same config and from a directory that resolves to this path."
+    )
     return 0
 
 
@@ -244,19 +252,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     s = _settings(args)
     kill = KillSwitch(s.paths.kill_file)
     print(
-        f"mode: {s.mode} | kill switch: {'SET - ' + kill.reason() if kill.is_set() else 'not set'}"
+        f"config mode: {s.mode} | kill switch ({s.paths.kill_file}): "
+        f"{'SET - ' + kill.reason() if kill.is_set() else 'not set'}"
     )
-    db = Path(s.paths.database)
-    if db.exists():
+    for mode in ("paper", "live"):
+        db = Path(database_path(s, mode))
+        if not db.exists():
+            print(f"[{mode}] no database yet ({db})")
+            continue
         store = Store(db)
         counts: dict[str, int] = {}
         for o in store.list_orders():
             counts[o.status.value] = counts.get(o.status.value, 0) + 1
-        print(f"orders by status: {counts or 'none'}")
-        uncertain = store.list_orders(
+        print(f"[{mode}] orders by status: {counts or 'none'}")
+        attention = store.list_orders(
             (OrderStatus.PENDING_SEND, OrderStatus.UNKNOWN, OrderStatus.LOST)
         )
-        for o in uncertain:
+        for o in attention:
             print(
                 f"  ATTENTION {o.status.value}: {o.symbol} {o.side.value} {o.quantity} "
                 f"id={o.client_order_id}"
@@ -267,6 +279,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_arm_live(args: argparse.Namespace) -> int:
     s = _settings(args)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(
+            "error: arming must be done interactively by a person in a terminal "
+            "(stdin/stdout are not a TTY); refusing to read the confirmation from a pipe.",
+            file=sys.stderr,
+        )
+        return 1
     path = arm_live_interactive(s, SystemClock().now_ms())
     return 0 if path else 1
 
@@ -279,11 +298,14 @@ def cmd_disarm_live(args: argparse.Namespace) -> int:
 
 def cmd_resolve_lost(args: argparse.Namespace) -> int:
     s = _settings(args)
-    store = Store(s.paths.database)
+    db = Path(database_path(s, args.mode))
+    if not db.exists():
+        raise BotuxError(f"no {args.mode} database at {db}")
+    store = Store(db)
     store.kv_set(f"lost:{args.symbol}", "")
     store.log_event(SystemClock().now_ms(), "WARNING", "resolve_lost", {"symbol": args.symbol})
     store.close()
-    print(f"{args.symbol}: LOST flag cleared by operator decision.")
+    print(f"{args.symbol}: LOST flag cleared in the {args.mode} database by operator decision.")
     return 0
 
 
@@ -352,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
         "resolve-lost", help="clear the LOST-order block after checking the exchange"
     )
     r.add_argument("symbol")
+    r.add_argument("--mode", choices=["paper", "live"], default="live")
     r.set_defaults(func=cmd_resolve_lost)
     return p
 
@@ -361,7 +384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except BotuxError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {GLOBAL_REDACTOR.scrub(str(exc))}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130

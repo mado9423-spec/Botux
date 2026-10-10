@@ -94,6 +94,24 @@ class TestBothNotionalFilters:
         assert r.violations(Side.BUY, OrderType.MARKET, ok, None, DEC("60000")) == []
 
 
+class TestSecondNotionalMinimumBindsOnItsOwn:
+    def test_the_nonprimary_filter_can_be_the_one_that_rejects(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        filters = exchange_info["symbols"][0]["filters"]
+        for f in filters:
+            if f["filterType"] == "NOTIONAL":
+                f["minNotional"] = "10"  # applies to MARKET orders
+        filters.append({"filterType": "MIN_NOTIONAL", "minNotional": "5", "applyToMarket": False})
+        r = SymbolRules.from_exchange_info(exchange_info, "BTCUSDT")
+        assert r.min_notional == DEC("5") and r.extra_min_notionals == ((DEC("10"), True),)
+        qty = DEC("0.00009")  # 5.4 USDT: passes the primary (5) but not the second (10)
+        assert any(
+            "NOTIONAL" in p
+            for p in r.violations(Side.BUY, OrderType.MARKET, qty, None, DEC("60000"))
+        )
+
+
 class TestRounding:
     def test_quantity_is_floored_never_rounded_up(self, rules: SymbolRules) -> None:
         assert rules.round_qty(DEC("0.123456789")) == DEC("0.12345")

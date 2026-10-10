@@ -140,12 +140,16 @@ def check_live_gate(settings: Settings, kill: KillSwitch, now_ms: int) -> LiveAu
                 problems.append("arming file does not carry the confirmation phrase")
             if data.get("fingerprint") != fingerprint:
                 problems.append("settings changed since arming; run 'botux arm-live' again")
-            armed_at = int(data.get("armed_at_ms", 0))
-            age_ms = now_ms - armed_at
-            if age_ms < -60_000:
-                problems.append("arming file is dated in the future")
-            elif age_ms > settings.live.arm_max_age_hours * HOUR_MS:
-                problems.append("arming has expired; run 'botux arm-live' again")
+            raw_armed_at = data.get("armed_at_ms")
+            if isinstance(raw_armed_at, bool) or not isinstance(raw_armed_at, int):
+                problems.append("arming file has an invalid timestamp")
+            else:
+                armed_at = raw_armed_at
+                age_ms = now_ms - armed_at
+                if age_ms < -60_000:
+                    problems.append("arming file is dated in the future")
+                elif age_ms > settings.live.arm_max_age_hours * HOUR_MS:
+                    problems.append("arming has expired; run 'botux arm-live' again")
     if problems:
         raise LiveTradingNotAllowed("live trading refused: " + "; ".join(problems))
     return LiveAuthorization(fingerprint=fingerprint, armed_at_ms=armed_at)

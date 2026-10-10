@@ -83,15 +83,87 @@ def test_arm_live_refuses_while_config_is_paper(cfg_path: str, tmp_path: Path) -
     assert not (tmp_path / "armed.json").exists()
 
 
+def test_arming_cannot_be_driven_from_a_pipe(
+    cfg_path: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import io
+
+    from botux.safety import ARM_PHRASE
+
+    # a perfectly valid live configuration ...
+    Path(cfg_path).write_text(
+        'mode = "live"\n'
+        "[paths]\n"
+        f'kill_file = "{tmp_path / "KILL"}"\n'
+        "[live]\n"
+        "enabled = true\n"
+        f'arm_file = "{tmp_path / "armed.json"}"\n'
+    )
+    # ... and the exact confirmation phrase arriving through a pipe, as a script would send it
+    monkeypatch.setattr("sys.stdin", io.StringIO(ARM_PHRASE + "\n"))
+    assert main(["-c", cfg_path, "arm-live"]) == 1
+    assert "TTY" in capsys.readouterr().err
+    assert not (tmp_path / "armed.json").exists()
+
+
+def test_error_messages_are_redacted(
+    cfg_path: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from botux.errors import BotuxError
+    from botux.secrets_guard import GLOBAL_REDACTOR
+
+    secret = "Z" * 64
+    GLOBAL_REDACTOR.register(secret)
+
+    def boom(_args: object) -> int:
+        raise BotuxError(f"server said: {secret}")
+
+    monkeypatch.setattr(cli, "cmd_check_config", boom)
+    assert main(["-c", cfg_path, "check-config"]) == 2
+    assert secret not in capsys.readouterr().err
+
+
+def test_status_reports_both_modes(
+    cfg_path: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from botux.models import OrderStatus, OrderType, Side
+    from botux.storage import OrderRecord
+
+    s = Store(tmp_path / "db-live.sqlite3")
+    s.insert_order(
+        OrderRecord(
+            "c1",
+            "k1",
+            "BTCUSDT",
+            Side.BUY,
+            OrderType.MARKET,
+            __import__("decimal").Decimal("1"),
+            None,
+            OrderStatus.UNKNOWN,
+            0,
+            0,
+        )
+    )
+    s.close()
+    assert main(["-c", cfg_path, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "[paper] no database yet" in out and "[live] orders by status" in out
+    assert "ATTENTION UNKNOWN" in out
+
+
 def test_disarm_and_resolve_lost(cfg_path: str, tmp_path: Path) -> None:
     assert main(["-c", cfg_path, "disarm-live"]) == 0
-    s = Store(tmp_path / "db.sqlite3")
+    s = Store(tmp_path / "db-live.sqlite3")  # every mode has its own database file
     s.kv_set("lost:BTCUSDT", "abc")
     s.close()
     assert main(["-c", cfg_path, "resolve-lost", "BTCUSDT"]) == 0
-    s = Store(tmp_path / "db.sqlite3")
+    s = Store(tmp_path / "db-live.sqlite3")
     assert not s.kv_get("lost:BTCUSDT")
     s.close()
+    assert main(["-c", cfg_path, "resolve-lost", "BTCUSDT", "--mode", "paper"]) == 2  # no such db
 
 
 def test_backtest_command_end_to_end_from_csv(

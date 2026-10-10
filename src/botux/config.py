@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import re
 import tomllib
@@ -62,7 +63,8 @@ MARKET_DATA_HOSTS = frozenset(
 )
 TRADING_HOSTS = MARKET_DATA_HOSTS - {"data-api.binance.vision"}
 
-_SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,20}$")
+_SYMBOL_RE = re.compile(r"[A-Z0-9]{5,20}")  # always used with fullmatch()
+_ASSET_RE = re.compile(r"[A-Z0-9]{2,10}")
 _SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|secret|token|passw)")
 _LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9]{40,}")
 _PLACEHOLDER_RE = re.compile(r"(?i)(your_|changeme|placeholder|example|xxx|<)")
@@ -202,11 +204,15 @@ def _int(table: Mapping[str, Any], key: str, default: int) -> int:
     return value
 
 
-def _num(table: Mapping[str, Any], key: str, default: float) -> float:
+def _num(table: Mapping[str, Any], key: str, default: float, lo: float, hi: float) -> float:
+    """A finite number within [lo, hi] (NaN/inf would silently disable time-based safeguards)."""
     value = table.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ConfigError(f"'{key}' must be a number")
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number) or not lo <= number <= hi:
+        raise ConfigError(f"'{key}' must be a finite number within [{lo}, {hi}]")
+    return number
 
 
 def _bool(table: Mapping[str, Any], key: str, default: bool) -> bool:
@@ -231,7 +237,19 @@ def _check_url(url: str, allowed_hosts: frozenset[str], what: str) -> None:
         raise ConfigError(
             f"{what} host '{parsed.hostname}' is not on the allow-list: {sorted(allowed_hosts)}"
         )
-    if parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query:
+    try:
+        has_port = parsed.port is not None
+    except ValueError:
+        has_port = True
+    if (
+        parsed.username
+        or parsed.password
+        or has_port
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.params
+        or parsed.fragment
+    ):
         raise ConfigError(f"{what} must be a bare origin like https://host")
 
 
@@ -273,7 +291,7 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
         raise ConfigError("market.symbols must be a list of 1 to 5 symbols")
     symbols: list[str] = []
     for s in symbols_raw:
-        if not isinstance(s, str) or not _SYMBOL_RE.match(s):
+        if not isinstance(s, str) or not _SYMBOL_RE.fullmatch(s):
             raise ConfigError(f"invalid symbol: {s!r}")
         symbols.append(s)
     if len(set(symbols)) != len(symbols):
@@ -289,8 +307,8 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
         interval=interval,
         market_data_base_url=_str(m, "market_data_base_url", dm.market_data_base_url),
         trading_base_url=_str(m, "trading_base_url", dm.trading_base_url),
-        poll_seconds=_num(m, "poll_seconds", 30.0),
-        max_candle_age_factor=_num(m, "max_candle_age_factor", 3.0),
+        poll_seconds=_num(m, "poll_seconds", 30.0, 1.0, 3600.0),
+        max_candle_age_factor=_num(m, "max_candle_age_factor", 3.0, 1.5, 100.0),
     )
     _check_url(market.market_data_base_url, MARKET_DATA_HOSTS, "market.market_data_base_url")
     _check_url(market.trading_base_url, TRADING_HOSTS, "market.trading_base_url")
@@ -334,7 +352,7 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
         fee_rate=_dec(e, "fee_rate", de.fee_rate),
         slippage_bps=_dec(e, "slippage_bps", de.slippage_bps),
         reconcile_attempts=_int(e, "reconcile_attempts", de.reconcile_attempts),
-        reconcile_interval_seconds=_num(e, "reconcile_interval_seconds", 5.0),
+        reconcile_interval_seconds=_num(e, "reconcile_interval_seconds", 5.0, 0.0, 60.0),
     )
     if execution.order_type != "MARKET":
         raise ConfigError(
@@ -360,7 +378,7 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
     live = LiveSettings(
         enabled=_bool(lv, "enabled", dl.enabled),
         arm_file=_str(lv, "arm_file", dl.arm_file),
-        arm_max_age_hours=_num(lv, "arm_max_age_hours", dl.arm_max_age_hours),
+        arm_max_age_hours=_num(lv, "arm_max_age_hours", dl.arm_max_age_hours, 0.01, 168.0),
         require_ip_restriction=_bool(lv, "require_ip_restriction", dl.require_ip_restriction),
         max_clock_skew_ms=_int(lv, "max_clock_skew_ms", dl.max_clock_skew_ms),
     )
@@ -378,6 +396,11 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
         data_dir=_str(pt, "data_dir", dp.data_dir),
         alerts_file=_str(pt, "alerts_file", dp.alerts_file),
     )
+    for name in ("kill_file", "database", "data_dir", "alerts_file"):
+        if not getattr(paths, name).strip():
+            raise ConfigError(f"paths.{name} must not be empty")
+    if not live.arm_file.strip():
+        raise ConfigError("live.arm_file must not be empty")
 
     return Settings(
         mode=mode,
@@ -392,6 +415,8 @@ def parse_settings(raw: Mapping[str, Any]) -> Settings:
 
 
 def _validate_risk(risk: RiskSettings, symbols: tuple[str, ...]) -> None:
+    if not _ASSET_RE.fullmatch(risk.quote_asset):
+        raise ConfigError(f"invalid risk.quote_asset: {risk.quote_asset!r}")
     for sym in symbols:
         if not sym.endswith(risk.quote_asset) or sym == risk.quote_asset:
             raise ConfigError(f"symbol {sym} does not use quote asset {risk.quote_asset}")
@@ -440,7 +465,36 @@ def load_settings(path: str | Path | None = None, env: Mapping[str, str] | None 
         raise ConfigError(f"config file not found: {cfg_path}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"invalid TOML in {cfg_path}: {exc}") from exc
-    return parse_settings(raw)
+    return _with_absolute_paths(parse_settings(raw))
+
+
+def _absolute(path: str) -> str:
+    return path if path == ":memory:" else os.path.abspath(os.path.expanduser(path))
+
+
+def _with_absolute_paths(settings: Settings) -> Settings:
+    """Resolve file locations against the current directory, once, so that every command (and the
+    arming fingerprint) refers to the SAME files regardless of where it is invoked from."""
+    p = settings.paths
+    return dataclasses.replace(
+        settings,
+        paths=PathSettings(
+            kill_file=_absolute(p.kill_file),
+            database=_absolute(p.database),
+            data_dir=_absolute(p.data_dir),
+            alerts_file=_absolute(p.alerts_file),
+        ),
+        live=dataclasses.replace(settings.live, arm_file=_absolute(settings.live.arm_file)),
+    )
+
+
+def database_path(settings: Settings, mode: str) -> str:
+    """Each mode gets its own database file: paper sessions reset state that live depends on."""
+    base = settings.paths.database
+    if base == ":memory:":
+        return base
+    path = Path(base)
+    return str(path.with_name(f"{path.stem}-{mode}{path.suffix}"))
 
 
 # --------------------------------------------------------------------------------------
@@ -461,11 +515,13 @@ def _jsonable(obj: Any) -> Any:
 
 
 def settings_summary(settings: Settings) -> dict[str, Any]:
-    """Everything that affects what live trading would do (excludes local file paths)."""
+    """Everything that affects what live trading would do.
+
+    The safety-relevant locations (kill file, database, arming file) and the arming lifetime are
+    included on purpose: re-pointing the kill file or lengthening the lifetime must invalidate an
+    existing arming.
+    """
     data = _jsonable(settings)
-    data.pop("paths", None)
-    data["live"].pop("arm_file", None)
-    data["live"].pop("arm_max_age_hours", None)
     data["paper"] = None  # irrelevant to live behaviour
     return dict(data)
 

@@ -19,7 +19,7 @@ from botux.exchange.rules import SymbolRules
 from botux.execution.order_manager import OrderIntent
 from botux.execution.paper import FaultKind
 from botux.killswitch import KillSwitch
-from botux.models import Candle, Fill, OrderStatus, OrderType, Quote, Side
+from botux.models import Balance, Candle, Fill, OrderStatus, OrderType, Quote, Side
 from botux.risk.manager import PortfolioView
 from botux.storage import OrderRecord, Store
 from botux.strategy.base import Signal
@@ -514,6 +514,21 @@ class TestBookkeepingAndBaseline:
         sells = [o for o in h.orders() if o.side is Side.SELL]
         assert sells and all(o.quantity < D("1") for o in sells)  # only the bot's own ~0.99 BTC
         assert h.paper.balances()["BTC"].free >= D(1)  # the user's 1 BTC is untouched
+
+    def test_the_baseline_survives_a_restart_and_still_includes_locked_coins(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        balances = {"BTC": Balance(free=D("0.5"), locked=D("0.5"))}
+        assert h.loop._position_qty("BTCUSDT", balances) == 0  # records the baseline (1.0 total)
+        assert store.kv_get("baseline:BTC") == "1.0"
+        h.loop._baseline.clear()  # a new process starts: the baseline must be read back from disk
+        assert h.loop._position_qty("BTCUSDT", balances) == 0
+        # only coins above the baseline are the bot's, and only FREE ones can be sold
+        more = {"BTC": Balance(free=D("1.2"), locked=D("0.5"))}
+        assert h.loop._position_qty("BTCUSDT", more) == D("0.7")
+        locked_up = {"BTC": Balance(free=D("0.1"), locked=D("1.6"))}
+        assert h.loop._position_qty("BTCUSDT", locked_up) == D("0.1")
 
     def test_entry_price_is_the_volume_weighted_average_of_all_fills(
         self, cfg: Settings, rules: SymbolRules, store: Store

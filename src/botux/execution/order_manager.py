@@ -288,9 +288,8 @@ class OrderManager:
             return  # try again next cycle; do not count a failed query as 'not found'
         if result is not None:
             self._apply(record, result)
-            if (
-                record.status in UNCERTAIN_STATUSES
-            ):  # the venue answered with a status we cannot read
+            # The venue answered, but with a status we cannot interpret: that is not progress.
+            if record.status in UNCERTAIN_STATUSES:
                 self._count_failed_attempt(record, "venue reports an unrecognised status")
             return
         if record.status in UNCERTAIN_STATUSES or record.status in OPEN_STATUSES:

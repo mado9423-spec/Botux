@@ -217,6 +217,26 @@ class TestUnconfirmedOrders:
         assert after.status is OrderStatus.UNKNOWN
 
 
+class TestUnrecognisedVenueStatus:
+    def test_an_unreadable_status_does_not_block_the_symbol_forever(self, env: Env) -> None:
+        env.broker.faults.push(FaultKind.TIMEOUT_NOT_EXECUTED)
+        r = env.om.submit(buy())
+        assert r.record is not None
+
+        class Weird:
+            def get_order(self, symbol: str, cid: str) -> OrderResult:
+                return OrderResult(
+                    cid, symbol, Side.BUY, OrderType.MARKET, OrderStatus.UNKNOWN, D("0.001")
+                )
+
+        om = env.manager(Weird())
+        for _ in range(5):
+            om.reconcile_pending()
+        rec = env.store.get_order(r.record.client_order_id)
+        assert rec is not None and rec.status is OrderStatus.LOST
+        assert "Order LOST" in env.notifier.titles()
+
+
 class TestCrashRecovery:
     def test_write_ahead_record_survives_a_crash_and_is_reconciled_not_resent(
         self, env: Env
