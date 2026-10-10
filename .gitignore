@@ -1,0 +1,50 @@
+# --- Secrets: never commit these -------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+secrets/
+secrets.*
+*.secret
+credentials*
+!credentials.py
+
+# --- Local runtime state (kill switch, live arming, DB, caches, logs) ------
+.botux/
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+logs/
+*.log
+
+# --- Local config overrides (the example file IS tracked) -------------------
+config/botux.toml
+config/*.local.toml
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Editors / OS -------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store

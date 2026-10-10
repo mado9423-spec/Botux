@@ -1,0 +1,73 @@
+# Botux settings (NON-SECRET). Copy to config/botux.toml to customise; that copy is git-ignored.
+# API keys must NEVER be placed here: the loader rejects any key/secret-looking field.
+#
+# These defaults are a conservative starting point for paper trading, not a recommendation.
+
+# "paper" is the default and the only mode that works out of the box.
+# "live" additionally needs [live].enabled = true AND a fresh arming file created by
+# `botux arm-live` (see docs/LIVE_TRADING_CHECKLIST.md). Do not change this lightly.
+mode = "paper"
+
+[market]
+symbols = ["BTCUSDT"]
+interval = "1h"
+# Public market-data host (no keys, documented as "market data only").
+market_data_base_url = "https://data-api.binance.vision"
+# Only used by the guarded live path. Host must be on the built-in allow-list.
+trading_base_url = "https://api.binance.com"
+poll_seconds = 30
+# A closed candle older than (this factor x interval) is treated as stale data.
+max_candle_age_factor = 3.0
+
+[strategy]
+name = "sma_cross"
+[strategy.params]
+fast = 20
+slow = 50
+
+[risk]
+quote_asset = "USDT"
+# Fraction of equity risked if the stop-loss is hit (0.005 = 0.5%).
+risk_per_trade_pct = "0.005"
+stop_loss_pct = "0.02"
+# Hard caps, in quote-asset units (USDT).
+max_order_notional = "100"
+max_position_notional = "200"
+max_total_exposure = "300"
+max_daily_loss = "20"
+max_open_orders = 3
+max_orders_per_day = 20
+max_consecutive_errors = 5
+# Safety margin on exchange MIN_NOTIONAL (the exchange checks against its own average price).
+min_notional_buffer = "1.05"
+# Reject LIMIT orders priced further than this from the reference price (fat-finger guard).
+max_price_deviation_pct = "0.02"
+# Emergency stop: also market-sell open positions (false = only cancel orders and halt).
+flatten_on_kill = false
+
+[execution]
+order_type = "MARKET"
+# Costs assumed by paper trading and backtests. Check YOUR account's real fee tier.
+fee_rate = "0.001"
+slippage_bps = "5"
+# Reconciliation of orders whose outcome is unknown.
+reconcile_attempts = 5
+reconcile_interval_seconds = 5
+
+[paper]
+starting_balance = "1000"
+
+[live]
+# Second, independent switch. Even with mode = "live" nothing is sent unless this is true
+# AND the arming file matches the current settings.
+enabled = false
+arm_file = ".botux/live_armed.json"
+arm_max_age_hours = 24
+require_ip_restriction = true
+max_clock_skew_ms = 1000
+
+[paths]
+kill_file = ".botux/KILL"
+database = "data/botux.sqlite3"
+data_dir = "data/cache"
+alerts_file = "data/alerts.jsonl"
