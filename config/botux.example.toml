@@ -18,6 +18,8 @@ trading_base_url = "https://api.binance.com"
 poll_seconds = 30
 # A closed candle older than (this factor x interval) is treated as stale data.
 max_candle_age_factor = 3.0
+# How often exchangeInfo (filters, symbol status) is re-read while running.
+rules_refresh_hours = 6
 
 [strategy]
 name = "sma_cross"

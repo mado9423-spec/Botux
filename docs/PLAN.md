@@ -1,7 +1,9 @@
 # خطة التنفيذ — Botux
 
-> هذه هي الخطة الأصلية التي كُتبت قبل التنفيذ. الحالة النهائية والقرارات اللاحقة (ومنها نتائج المراجعات المستقلة) في
-> [DECISIONS.md](DECISIONS.md) و[ARCHITECTURE.md](ARCHITECTURE.md) و[RISKS_AND_LIMITATIONS.md](RISKS_AND_LIMITATIONS.md).
+> هذه هي الخطة الأصلية التي كُتبت قبل التنفيذ وتُركت كما هي تاريخياً (بعض بنودها تغيّر: مثلاً رأس المال صار `risk.bot_capital`، وحد الخسارة اليومية
+> يدوي الرفع، و`order/test` متاح عبر `live-check`). الحالة الحالية والقرارات اللاحقة (ومنها نتائج المراجعات المستقلة) في
+> [DECISIONS.md](DECISIONS.md) و[ARCHITECTURE.md](ARCHITECTURE.md) و[MODES.md](MODES.md) و[RISKS_AND_LIMITATIONS.md](RISKS_AND_LIMITATIONS.md)
+> و[VERIFICATION.md](VERIFICATION.md).
 
 > مشروع تعليمي لبوت تداول على **Binance Spot** فقط. الوضع الافتراضي والوحيد الذي يعمل دون إعداد إضافي هو
 > **المحاكاة/التداول الورقي**. لا شيء هنا وعد بربح أو وصف لإعداد بأنه آمن أو مضمون.
