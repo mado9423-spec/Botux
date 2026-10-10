@@ -879,3 +879,42 @@ class TestCancelPathsAndRestarts:
         h.paper.fill_plan.push("0")  # (would be visible if a second SELL were sent)
         h.loop.run_cycle()
         assert h.paper.placed_count == placed  # no second SELL while the first is unresolved
+
+
+class TestAFreshLiveDatabaseNeedsTheMoneyItAssumes:
+    """bot_capital larger than what the account holds would look like 'missing' funds later."""
+
+    def build(self, settings: Settings, clock: FakeClock, store: Store, balance: str):  # type: ignore[no-untyped-def]
+        s = live(settings)
+        arm_live_interactive(s, clock.now_ms(), lambda _p: ARM_PHRASE, lambda _t: None)
+        ex = live_exchange(clock)
+        ex.on(
+            "GET",
+            "/api/v3/account",
+            {
+                "canTrade": True,
+                "uid": 4242,
+                "balances": [{"asset": "USDT", "free": balance, "locked": "0"}],
+            },
+        )
+        return build_live_app(s, ENV, http=ex.http(), clock=clock, store=store)
+
+    def test_an_underfunded_account_is_refused_before_anything_starts(
+        self, settings: Settings, clock: FakeClock, store: Store
+    ) -> None:
+        with pytest.raises(LiveTradingNotAllowed, match=r"less than risk\.bot_capital"):
+            self.build(settings, clock, store, "499.99")  # live() uses bot_capital = 500
+        assert store.kv_get("ledger:epoch") is None  # nothing was started
+
+    def test_an_exactly_funded_account_starts(
+        self, settings: Settings, clock: FakeClock, store: Store
+    ) -> None:
+        app = self.build(settings, clock, store, "500")
+        app.close()
+
+    def test_a_database_with_history_is_not_rechecked_here(
+        self, settings: Settings, clock: FakeClock, store: Store
+    ) -> None:
+        store.kv_set("ledger:epoch", "0")  # a previous run: later shortfalls are 'discrepancies'
+        app = self.build(settings, clock, store, "100")
+        app.close()

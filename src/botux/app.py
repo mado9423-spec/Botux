@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 
 import httpx
 
@@ -262,6 +263,24 @@ def make_gate_check(
     return check
 
 
+def check_funding(store: Store, broker: Broker, settings: Settings) -> None:
+    """A fresh live database must start with at least ``risk.bot_capital`` on the account.
+
+    Otherwise the bot would think funds it never had had "gone missing". (Once the database has
+    history, a later shortfall is a genuine discrepancy handled by the ownership checks.)
+    """
+    if store.kv_get("ledger:epoch") or settings.bot_capital is None:
+        return
+    quote = settings.risk.quote_asset
+    held = broker.balances().get(quote)
+    total = held.total if held is not None else Decimal(0)
+    if total < settings.bot_capital:
+        raise LiveTradingNotAllowed(
+            f"the account holds {total:f} {quote}, less than risk.bot_capital "
+            f"({settings.bot_capital:f}): fund the account or lower bot_capital"
+        )
+
+
 def bind_account(store: Store, uid: str | None) -> None:
     """A live database belongs to ONE Binance account; a different key pointing at another
     account must not inherit this database's baselines, ledger and positions."""
@@ -311,7 +330,8 @@ def build_live_app(
     try:
         store.claim_mode("live")
         bind_account(store, getattr(broker, "account_uid", None))
-    except (ConfigError, LiveTradingNotAllowed):
+        check_funding(store, broker, settings)
+    except (ConfigError, LiveTradingNotAllowed, ExchangeError):
         client.close()
         if owns_store:
             store.close()
