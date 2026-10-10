@@ -118,6 +118,13 @@ def run_live_check(
                 report(
                     ok, f"{sym}: status {r.status}, spot trading allowed = {r.spot_trading_allowed}"
                 )
+                if r.max_position:
+                    report(
+                        True,
+                        f"{sym}: MAX_POSITION filter {r.max_position} {r.base_asset} (cap on your "
+                        "TOTAL holding): the bot does not check it locally; the exchange rejects "
+                        "a BUY beyond it",
+                    )
 
             attempt(f"{sym} rules", load)
 

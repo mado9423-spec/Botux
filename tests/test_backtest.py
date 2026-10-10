@@ -193,23 +193,113 @@ class TestMetrics:
             m.buy_and_hold_same_capital * m.exposure
         )
 
-    def test_buy_and_hold_baseline_uses_the_same_capital_as_the_strategy(
+    def test_buy_and_hold_baseline_uses_the_capital_the_strategy_really_deployed(
         self, rules: SymbolRules
     ) -> None:
         c = candles_from_closes([100] * 5 + [110] * 10)  # +10% in total
-        res = run(c, rules)  # default caps: at most 100 of the 1000 start cash is deployed
+        res = run(c, rules)  # default caps: the 100 order cap binds on a 1000 account
         assert res.buy_and_hold_return == pytest.approx(0.10)
-        assert res.buy_and_hold_same_capital == pytest.approx(0.01)  # 100/1000 of +10%
-        rich = run(
-            c,
-            rules,
-            risk=RiskSettings(
-                max_order_notional=D(5000),
-                max_position_notional=D(5000),
-                max_total_exposure=D(5000),
-            ),
+        assert res.entries == 1 and D("99") < res.avg_entry_notional <= D(100)
+        assert res.buy_and_hold_same_capital == pytest.approx(
+            0.10 * float(res.avg_entry_notional) / 1000
         )
-        assert rich.buy_and_hold_same_capital == pytest.approx(0.10)  # capped by the cash itself
+        # when risk-per-trade (not the cap) limits the size, the baseline shrinks with it:
+        # a 300 account deploys about 65 per entry, NOT the 100 the caps would allow
+        small = run_backtest(
+            c, create_strategy("sma_cross", FAST_SLOW), rules, RiskSettings(),
+            initial_cash=D(300), fee_rate=D("0.001"), slippage_bps=D(5), interval_ms=HOUR_MS,
+        )  # fmt: skip
+        assert small.avg_entry_notional < D(70)
+        assert small.buy_and_hold_same_capital == pytest.approx(
+            0.10 * float(small.avg_entry_notional) / 300
+        )
+        assert small.buy_and_hold_same_capital < 0.10 * 100 / 300 * 0.8  # not the old 100/300
+
+    def test_without_any_entry_the_baseline_falls_back_to_the_nominal_cap(
+        self, rules: SymbolRules
+    ) -> None:
+        res = run(candles_from_closes([100] * 20), rules)
+        assert res.entries == 0 and res.avg_entry_notional == 0
+        assert res.buy_and_hold_same_capital == 0  # flat market: 0% of anything
+
+    def test_a_decision_is_dropped_rather_than_filled_across_a_gap(
+        self, rules: SymbolRules
+    ) -> None:
+        full = candles_from_closes(SCENARIO)  # the BUY decision is taken at candle 4's close
+        gapped = full[:5] + full[8:]  # candles 5, 6, 7 are missing
+        res = run(gapped, rules)
+        assert res.signals_dropped_at_gaps >= 1
+        assert not res.trades or res.trades[0].entry_time_ms != gapped[5].open_time_ms
+
+    def test_exact_metrics_for_a_hand_built_equity_curve(self) -> None:
+        from botux.backtest.engine import Trade
+
+        res = BacktestResult(
+            initial_cash=D(1000), final_equity=D(1020), interval_ms=HOUR_MS,
+            candles_total=4, candles_in_position=2,
+        )  # fmt: skip
+        res.equity_curve = [
+            (1, D(1100)), (2, D(990)), (3, D(1080)), (4, D(1020)),
+        ]  # fmt: skip
+        res.trades = [
+            Trade(0, 1, D(100), D(110), D(1), D(30), D(1), "signal"),
+            Trade(2, 3, D(110), D(105), D(1), D(-10), D(1), "stop"),
+            Trade(3, 4, D(105), D(110), D(1), D(5), D(1), "signal"),
+        ]
+        m = compute_metrics(res)
+        assert m.total_return == pytest.approx(0.02)
+        assert m.max_drawdown == pytest.approx((1100 - 990) / 1100)  # the peak starts at the cash
+        assert m.trades == 3 and m.win_rate == pytest.approx(2 / 3)
+        assert m.profit_factor == pytest.approx(35 / 10)  # gross wins / gross losses
+        assert m.avg_trade_pnl == pytest.approx(25 / 3)
+        assert m.exposure == pytest.approx(0.5)
+        rets = [990 / 1100 - 1, 1080 / 990 - 1, 1020 / 1080 - 1]
+        mean = sum(rets) / 3
+        sd = (sum((r - mean) ** 2 for r in rets) / 2) ** 0.5
+        year_candles = 365 * 24
+        assert m.sharpe == pytest.approx(mean / sd * year_candles**0.5)  # annualised by sqrt(N)
+
+    def test_a_drawdown_that_starts_below_the_initial_cash_is_measured_from_it(self) -> None:
+        res = BacktestResult(
+            initial_cash=D(1000), final_equity=D(950), interval_ms=HOUR_MS, candles_total=2
+        )
+        res.equity_curve = [(1, D(900)), (2, D(950))]
+        assert compute_metrics(res).max_drawdown == pytest.approx(0.10)
+
+    def test_a_loss_that_happens_early_in_a_day_counts_even_if_nothing_is_traded_until_later(
+        self, rules: SymbolRules
+    ) -> None:
+        day_ms = 86_400_000
+        start = (T0 // day_ms + 1) * day_ms  # a UTC midnight
+        day1 = [100] * 20 + [101, 103, 104, 104]  # long from candle 21, still open at midnight
+        day2 = [104, 90, 90, 90, 90, 92, 95, 98, 99, 99] + [99] * 14  # stopped out at 01:00, rally
+        assert len(day1) == 24 and len(day2) == 24
+        candles = candles_from_closes(day1 + day2, start=start)
+        free = run(candles, rules, risk=RiskSettings(max_daily_loss=D(500)))
+        limited = run(candles, rules, risk=RiskSettings(max_daily_loss=D("0.5")))
+        assert len(free.trades) >= 2  # the later rally is traded when there is no limit ...
+        assert len(limited.trades) == 1  # ... but not after the early-morning loss tripped it
+
+    def test_a_stop_can_hit_on_the_entry_candle_itself(self, rules: SymbolRules) -> None:
+        c = candles_from_closes(SCENARIO[:6])
+        # the entry candle (index 5) opens at the signal price and its low pierces the 2% stop
+        c[5] = make_candle(5, "103", "103.5", "99", "100")
+        res = run(c[:6], rules)
+        stops = [t for t in res.trades if t.exit_reason == "stop"]
+        assert stops and stops[0].exit_time_ms == c[5].open_time_ms
+
+    def test_after_a_daily_loss_halt_a_second_entry_the_same_day_is_refused(
+        self, rules: SymbolRules
+    ) -> None:
+        day_ms = 86_400_000
+        start = (T0 // day_ms + 1) * day_ms
+        # buy, get stopped out (loss > the tiny limit), then a fresh crossover later the SAME day
+        closes = [100] * 4 + [101, 103, 104, 104, 100, 90, 90, 90, 90, 92, 95, 98, 99, 99]
+        candles = candles_from_closes(closes, start=start)
+        free = run(candles, rules, risk=RiskSettings(max_daily_loss=D(500)))
+        halted = run(candles, rules, risk=RiskSettings(max_daily_loss=D("0.5")))
+        assert len(free.trades) >= 2  # without the limit the second signal is traded
+        assert len(halted.trades) == 1  # with it, the second entry that day is refused
 
     def test_no_trades_means_flat_equity(self, rules: SymbolRules) -> None:
         m = compute_metrics(run(candles_from_closes([100] * 20), rules))
@@ -328,6 +418,42 @@ class TestStudy:
         cold = run_backtest(c[10:], strat(), rules, RiskSettings(), **common)  # type: ignore[arg-type]
         warm = run_backtest(c[10:], strat(), rules, RiskSettings(), history=c[:10], **common)  # type: ignore[arg-type]
         assert cold.trades == [] and len(warm.trades) == 1
+
+    def test_the_shortlist_is_the_top_train_results_among_eligible_combinations(
+        self, rules: SymbolRules
+    ) -> None:
+        report = self.study(rules, self.wavy(1200))
+        eligible = [pm for pm in report.grid if pm[1].trades >= 5]
+        best = sorted(eligible, key=lambda pm: pm[1].total_return, reverse=True)[:3]
+        assert [p for p, _, _ in report.shortlist] == [p for p, _ in best]
+        # train results shown for the short list are the very train results of the grid
+        for params, train_m, _ in report.shortlist:
+            assert train_m == {repr(p): m for p, m in report.grid}[repr(params)]
+
+    def test_combinations_with_too_few_trades_are_not_eligible(self, rules: SymbolRules) -> None:
+        report = self.study(rules, self.wavy(900))
+        assert all(m.trades >= 5 for _, m, _ in report.shortlist)
+        # a grid where no combination trades enough falls back to the defaults, with a warning
+        quiet = self.study(
+            rules, candles_from_closes([100] * 900), grid={"fast": [5], "slow": [20]}
+        )
+        assert not quiet.chosen_from_grid and quiet.chosen_params == {"fast": 5, "slow": 20}
+        assert any("falling back" in w for w in quiet.warnings)
+
+    def test_the_default_reference_run_uses_the_default_parameters(
+        self, rules: SymbolRules, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[dict[str, object]] = []
+        real = create_strategy
+
+        def spy(name: str, params: object) -> object:
+            seen.append(dict(params))  # type: ignore[call-overload]
+            return real(name, params)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("botux.backtest.study.create_strategy", spy)
+        report = self.study(rules, self.wavy(900), default_params={"fast": 3, "slow": 11})
+        assert seen[-1] == {"fast": 3, "slow": 11}  # the very last run: defaults on the test data
+        assert seen[-2] == report.chosen_params  # the one before: the chosen parameters, once
 
     def test_too_little_data_is_refused(self, rules: SymbolRules) -> None:
         with pytest.raises(DataError):
@@ -504,3 +630,58 @@ class TestMarketData:
         )
         assert got == all_candles and ex.count("/api/v3/klines") == 3
         assert check_candles(got, HOUR_MS).ok
+
+
+class TestLiveMarketFeedHelpers:
+    """fetch_quote / fetch_latest_closed are what the live loop really calls."""
+
+    def client(self, ex: FakeExchange, clock: object) -> BinanceSpotClient:
+        return BinanceSpotClient(http=ex.http(), clock=clock)  # type: ignore[arg-type]
+
+    def test_quote_validation(self, clock: object) -> None:
+        from botux.data.market import fetch_quote
+
+        ex = FakeExchange()
+        c = self.client(ex, clock)
+        for body, ok in (
+            ({"bidPrice": "99.99", "askPrice": "100.01"}, True),
+            ({"bidPrice": "0.00000000", "askPrice": "0.00000000"}, False),  # halted symbol
+            ({"bidPrice": "100.02", "askPrice": "100.01"}, False),  # crossed book
+            ({"bidPrice": "-1", "askPrice": "100"}, False),
+            ({"bidPrice": "abc", "askPrice": "100"}, False),
+            ({"askPrice": "100"}, False),  # missing key
+        ):
+            ex.on("GET", "/api/v3/ticker/bookTicker", body)
+            if ok:
+                q = fetch_quote(c, "BTCUSDT", 123)
+                assert (q.bid, q.ask, q.ts_ms) == (D("99.99"), D("100.01"), 123)
+            else:
+                with pytest.raises(DataError):
+                    fetch_quote(c, "BTCUSDT", 123)
+
+    def test_latest_closed_drops_the_forming_and_the_just_closed_candle_and_honours_count(
+        self, clock: object
+    ) -> None:
+        import httpx
+
+        from botux.data.market import fetch_latest_closed
+
+        candles = candles_from_closes([100 + i for i in range(60)])
+        ex = FakeExchange()
+        seen: dict[str, str] = {}
+
+        def klines(req: httpx.Request) -> httpx.Response:
+            seen.update(req.url.params)
+            now = T0 + 50 * HOUR_MS + 1_000  # candle 49 closed 1 s ago (inside the grace period)
+            shown = [c for c in candles if c.open_time_ms <= now]  # includes the forming candle 50
+            return httpx.Response(200, json=kline_rows(shown))
+
+        ex.on("GET", "/api/v3/klines", klines)
+        now_ms = T0 + 50 * HOUR_MS + 1_000
+        got = fetch_latest_closed(self.client(ex, clock), "BTCUSDT", "1h", 10, now_ms)
+        assert seen["limit"] == "11"  # one extra: the forming candle is requested and dropped
+        assert len(got) == 10
+        assert got[-1].open_time_ms == candles[48].open_time_ms  # 49 is inside the 2 s grace
+        assert all(c.close_time_ms < now_ms - 2_000 for c in got)
+        later = fetch_latest_closed(self.client(ex, clock), "BTCUSDT", "1h", 10, now_ms + 5_000)
+        assert later[-1].open_time_ms == candles[49].open_time_ms

@@ -146,7 +146,10 @@ def fetch_latest_closed(
 
 def fetch_quote(client: BinanceSpotClient, symbol: str, now_ms: int) -> Quote:
     data = client.book_ticker(symbol)
-    bid, ask = D(data["bidPrice"]), D(data["askPrice"])
+    try:
+        bid, ask = D(data["bidPrice"]), D(data["askPrice"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataError(f"unreadable book ticker for {symbol}") from exc
     if bid <= 0 or ask <= 0 or bid > ask:
         raise DataError(f"invalid book ticker for {symbol}: bid={bid} ask={ask}")
     return Quote(symbol, bid, ask, now_ms)

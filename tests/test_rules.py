@@ -216,3 +216,152 @@ def _entry(rules: SymbolRules) -> dict:  # type: ignore[type-arg]
     from tests.conftest import EXCHANGE_INFO_BTCUSDT
 
     return dict(EXCHANGE_INFO_BTCUSDT["symbols"][0])
+
+
+def _with_filters(
+    exchange_info: dict[str, Any], drop: tuple[str, ...] = (), **replacements: dict[str, Any]
+) -> SymbolRules:
+    """Rules built from the sample exchangeInfo with some filters replaced/added by type."""
+    info = {**exchange_info, "symbols": [dict(exchange_info["symbols"][0])]}
+    kept = [
+        f
+        for f in info["symbols"][0]["filters"]
+        if f["filterType"] not in replacements and f["filterType"] not in drop
+    ]
+    info["symbols"][0]["filters"] = kept + list(replacements.values())
+    return SymbolRules.from_exchange_info(info, "BTCUSDT")
+
+
+NOTIONAL = {
+    "filterType": "NOTIONAL",
+    "minNotional": "5.00000000",
+    "applyMinToMarket": True,
+    "maxNotional": "100.00000000",
+    "applyMaxToMarket": False,
+    "avgPriceMins": 5,
+}
+
+
+class TestNotionalAndPercentPriceSemantics:
+    """Pin the filter semantics of filters.md so a regression in the local validator is noticed."""
+
+    def test_max_notional_applies_to_limit_orders_always_and_to_market_only_when_asked(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        not_to_market = _with_filters(exchange_info, NOTIONAL=NOTIONAL)
+        to_market = _with_filters(exchange_info, NOTIONAL={**NOTIONAL, "applyMaxToMarket": True})
+        big = DEC("0.002")  # 0.002 x 60000 = 120 USDT > 100
+        limit = (Side.BUY, OrderType.LIMIT, big, DEC("60000.00"), DEC("60000"))
+        market = (Side.BUY, OrderType.MARKET, big, None, DEC("60000"))
+        assert any("NOTIONAL" in p and "> 100" in p for p in not_to_market.violations(*limit))
+        assert not any("> 100" in p for p in not_to_market.violations(*market))
+        assert any("NOTIONAL" in p and "> 100" in p for p in to_market.violations(*market))
+        small = (Side.BUY, OrderType.MARKET, DEC("0.001"), None, DEC("60000"))  # 60 USDT
+        assert to_market.violations(*small) == []
+
+    def test_a_market_order_below_min_notional_passes_when_it_is_not_applied_to_market(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        r = _with_filters(exchange_info, NOTIONAL={**NOTIONAL, "applyMinToMarket": False})
+        tiny = DEC("0.00005")  # 3 USDT < 5
+        assert r.violations(Side.BUY, OrderType.MARKET, tiny, None, DEC("60000")) == []
+        assert any(
+            "NOTIONAL" in p
+            for p in r.violations(Side.BUY, OrderType.LIMIT, tiny, DEC("60000.00"), DEC("60000"))
+        )  # ... but a LIMIT order always has to meet it
+
+    def test_percent_price_by_side_uses_the_bid_multipliers_for_buys_and_ask_for_sells(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        r = _with_filters(
+            exchange_info,
+            PERCENT_PRICE_BY_SIDE={
+                "filterType": "PERCENT_PRICE_BY_SIDE",
+                "bidMultiplierUp": "1.1", "bidMultiplierDown": "0.9",
+                "askMultiplierUp": "1.5", "askMultiplierDown": "0.5",
+                "avgPriceMins": 5,
+            },
+        )  # fmt: skip
+        ref = DEC("60000")
+        price = DEC("80000.00")  # +33%: too high for a BUY (limit 1.1), fine for a SELL (1.5)
+        buy = r.violations(Side.BUY, OrderType.LIMIT, DEC("0.001"), price, ref)
+        sell = r.violations(Side.SELL, OrderType.LIMIT, DEC("0.001"), price, ref)
+        assert any("PERCENT_PRICE" in p and "too high" in p for p in buy)
+        assert not any("PERCENT_PRICE" in p for p in sell)
+        low = DEC("40000.00")  # -33%: too low for a SELL (0.5 floor is fine) vs a BUY (0.9)
+        assert any(
+            "too low" in p for p in r.violations(Side.BUY, OrderType.LIMIT, DEC("0.001"), low, ref)
+        )
+        assert not any(
+            "PERCENT_PRICE" in p
+            for p in r.violations(Side.SELL, OrderType.LIMIT, DEC("0.001"), low, ref)
+        )
+
+    def test_the_legacy_percent_price_filter_maps_up_and_down_correctly(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        r = _with_filters(
+            exchange_info,
+            drop=("PERCENT_PRICE_BY_SIDE",),
+            PERCENT_PRICE={
+                "filterType": "PERCENT_PRICE", "multiplierUp": "1.2", "multiplierDown": "0.8",
+                "avgPriceMins": 5,
+            },
+        )  # fmt: skip
+        assert (r.percent_up_buy, r.percent_down_buy) == (DEC("1.2"), DEC("0.8"))
+        assert (r.percent_up_sell, r.percent_down_sell) == (DEC("1.2"), DEC("0.8"))
+        ref = DEC("1000")
+
+        def problems(side: Side, price: str) -> list[str]:
+            return r.violations(side, OrderType.LIMIT, DEC("1"), DEC(price), ref)
+
+        for side in (Side.BUY, Side.SELL):
+            assert any("too high" in p for p in problems(side, "1300.00"))
+            assert any("too low" in p for p in problems(side, "700.00"))
+            assert not any("PERCENT_PRICE" in p for p in problems(side, "1000.00"))
+
+    def test_both_min_notional_and_notional_are_kept_and_evaluated_independently(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        r = _with_filters(
+            exchange_info,
+            MIN_NOTIONAL={
+                "filterType": "MIN_NOTIONAL",
+                "minNotional": "20.0",
+                "applyToMarket": True,
+                "avgPriceMins": 5,
+            },
+            NOTIONAL=NOTIONAL,
+        )
+        problems = r.violations(Side.BUY, OrderType.MARKET, DEC("0.0002"), None, DEC("60000"))  # 12
+        assert any("NOTIONAL" in p for p in problems)  # passes the 5 minimum, fails the 20 one
+
+
+class TestStatusIsAnEntryRuleNotAnExitRule:
+    """A protective SELL must not be refused locally because a stale status says not-TRADING."""
+
+    def test_buys_are_refused_but_sells_are_left_to_the_exchange(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        exchange_info["symbols"][0]["status"] = "BREAK"
+        r = SymbolRules.from_exchange_info(exchange_info, "BTCUSDT")
+        args = (OrderType.MARKET, DEC("0.001"), None, DEC("60000"))
+        assert any("not TRADING" in p for p in r.violations(Side.BUY, *args))
+        assert not any("not TRADING" in p for p in r.violations(Side.SELL, *args))
+
+    def test_cancel_only_status_is_parsed_and_blocks_entries(
+        self, exchange_info: dict[str, Any]
+    ) -> None:
+        exchange_info["symbols"][0]["status"] = "CANCEL_ONLY"
+        r = SymbolRules.from_exchange_info(exchange_info, "BTCUSDT")
+        assert r.violations(Side.BUY, OrderType.MARKET, DEC("0.001"), None, DEC("60000"))
+
+
+class TestMaxPosition:
+    def test_it_is_parsed_but_not_enforced_locally(self, exchange_info: dict[str, Any]) -> None:
+        r = _with_filters(
+            exchange_info,
+            MAX_POSITION={"filterType": "MAX_POSITION", "maxPosition": "10.00000000"},
+        )
+        assert r.max_position == DEC("10")
+        assert r.violations(Side.BUY, OrderType.MARKET, DEC("0.001"), None, DEC("60000")) == []

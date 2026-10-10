@@ -58,8 +58,11 @@ class BacktestResult:
     candles_total: int = 0
     fees_paid: Decimal = ZERO
     buy_and_hold_return: float = 0.0  # 100% of the initial cash invested for the whole period
-    buy_and_hold_same_capital: float = 0.0  # same capital cap as the strategy, on total equity
+    buy_and_hold_same_capital: float = 0.0  # scaled to the capital the strategy really deployed
     interval_ms: int = 0
+    entries: int = 0
+    avg_entry_notional: Decimal = ZERO  # quote spent per entry, on average (0 when none)
+    signals_dropped_at_gaps: int = 0  # decisions discarded because candles were missing
 
 
 def run_backtest(
@@ -122,12 +125,20 @@ def run_backtest(
         trade_fees = ZERO
 
     n = len(candles)
+    entry_costs: list[Decimal] = []
     lookback = list(history[-strategy.warmup :]) if strategy.warmup > 0 else []
     seen = lookback + list(candles)  # what the strategy may look at (never beyond candle i)
     offset = len(lookback)
     day = -1
     for i, c in enumerate(candles):
         clock.set_ms(c.open_time_ms)
+        if i > 0 and c.open_time_ms != candles[i - 1].close_time_ms + 1:
+            # candles are missing: the order decided at the previous close would be filled at a
+            # price from after the gap, which the live bot (that refuses to trade on a gap) never
+            # sees. Drop the decision rather than invent a fill.
+            if pending is not Signal.HOLD:
+                res.signals_dropped_at_gaps += 1
+            pending = Signal.HOLD
         if c.open_time_ms // 86_400_000 != day:
             day = c.open_time_ms // 86_400_000
             if rm.daily_loss_halted:  # modelled human reset, see the module docstring
@@ -149,6 +160,7 @@ def run_backtest(
                     cash -= cost
                     base += sizing.quantity - fee_base
                     entry_price, entry_cost, entry_time = price, cost, c.open_time_ms
+                    entry_costs.append(cost)
                     stop_price = rm.stop_price(price)
                     trade_fees = fee_base * price  # base-asset fee valued at entry price
                     res.fees_paid += fee_base * price
@@ -177,8 +189,15 @@ def run_backtest(
     res.final_equity = cash + base * candles[-1].close if candles else initial_cash
     if candles:
         res.buy_and_hold_return = float(candles[-1].close / candles[0].open - 1)
-        # The strategy never deploys more than the per-order/position caps, so comparing it with a
-        # 100%-invested baseline would flatter the baseline: scale the baseline to the same capital.
-        deployed = min(risk.max_order_notional, risk.max_position_notional, initial_cash)
+        res.entries = len(entry_costs)
+        res.avg_entry_notional = sum(entry_costs, ZERO) / len(entry_costs) if entry_costs else ZERO
+        # Comparing the strategy with a 100%-invested baseline would flatter the baseline, so the
+        # baseline is scaled to the capital the strategy ACTUALLY put to work per entry (sizing is
+        # often limited by risk-per-trade, not by the caps); with no entry at all, the nominal cap.
+        deployed = (
+            res.avg_entry_notional
+            if entry_costs
+            else min(risk.max_order_notional, risk.max_position_notional, initial_cash)
+        )
         res.buy_and_hold_same_capital = res.buy_and_hold_return * float(deployed / initial_cash)
     return res

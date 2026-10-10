@@ -14,7 +14,7 @@ import signal
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import FrameType
 
@@ -111,11 +111,33 @@ def _download(
     return candles
 
 
+MAX_CASH = 10**12  # anything beyond this is a typo, and float reporting math would overflow
+
+
+def _positive_decimal(text: str) -> Decimal:
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not value.is_finite() or not 0 < value <= MAX_CASH:
+        raise argparse.ArgumentTypeError(
+            f"must be a positive number not above {MAX_CASH:,}: {text!r}"
+        )
+    return value
+
+
 def cmd_backtest(args: argparse.Namespace) -> int:
     s = _settings(args)
+    client = public_client(s)
+    try:
+        return _backtest(args, s, client)
+    finally:
+        client.close()
+
+
+def _backtest(args: argparse.Namespace, s: Settings, client: BinanceSpotClient) -> int:
     interval = args.interval or s.market.interval
     symbol = args.symbol or s.market.symbols[0]
-    client = public_client(s)
     interval_ms = SUPPORTED_INTERVALS[interval]
     if args.data:
         candles = load_csv(Path(args.data))
@@ -135,13 +157,18 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     report_data = check_candles(candles, interval_ms)
     if report_data.fatal:
         raise BotuxError(f"data problems: {report_data.describe()}")
+    print(f"data check: {report_data.describe()}")
+    if report_data.gaps:
+        print(
+            "WARNING: the data has gaps; a decision that would be filled across a gap is "
+            "dropped instead of being filled at a price from after it."
+        )
     rules = SymbolRules.from_exchange_info(client.exchange_info(symbol), symbol)
 
     grid = DEFAULT_GRIDS.get(s.strategy.name, {})
     first, last = candles[0].open_time_ms, candles[-1].close_time_ms
     days = (last - first) / 86_400_000
     utc = "%Y-%m-%d"
-    deployed = min(s.risk.max_order_notional, s.risk.max_position_notional, args.cash)
     print(
         f"\n{symbol} {interval}: {len(candles)} candles over {days:.0f} days, "
         f"{datetime.fromtimestamp(first / 1000, UTC):{utc}} to "
@@ -158,8 +185,9 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         "complete fills, no latency or outages"
     )
     print(
-        f"  - capital: start {args.cash} {s.risk.quote_asset}; at most {deployed} is deployed "
-        "(order/position caps), so the buy&hold baselines are scaled to the same capital"
+        f"  - capital: start {args.cash} {s.risk.quote_asset}; each entry is sized by "
+        f"risk-per-trade and capped at {s.risk.max_order_notional} per order, so the buy&hold "
+        "baselines are scaled to the capital the strategy actually deployed per entry"
     )
     print(
         "  - exchange filters are today's, not historical; the daily-loss halt is reset "
@@ -480,7 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--days", type=int, default=365)
     b.add_argument("--data", default=None, help="CSV from 'fetch-data' instead of downloading")
     b.add_argument("--save", default=None, help="save the downloaded candles to this CSV")
-    b.add_argument("--cash", type=Decimal, default=Decimal(1000))
+    b.add_argument("--cash", type=_positive_decimal, default=Decimal(1000))
     b.add_argument("--train-fraction", type=float, default=0.5)
     b.add_argument("--validation-fraction", type=float, default=0.2)
     b.add_argument(

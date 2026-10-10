@@ -271,3 +271,13 @@ def test_backtest_walk_forward_and_report_content(
     out = capsys.readouterr().out
     for needle in ("Walk-forward (", "fold 1:", "Chained out-of-sample return", "Limitations"):
         assert needle in out, needle
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", "NaN", "inf", "abc", "1e400"])
+def test_backtest_rejects_a_nonsensical_cash_amount_cleanly(
+    bad: str, cfg_path: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as e:
+        main(["-c", cfg_path, "backtest", "--cash", bad])
+    assert e.value.code == 2  # argparse's own clean usage error, never a traceback
+    assert "--cash" in capsys.readouterr().err

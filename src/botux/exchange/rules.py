@@ -5,10 +5,13 @@ Reference: https://github.com/binance/binance-spot-api-docs/blob/master/filters.
 We validate every order locally against PRICE_FILTER, LOT_SIZE, MARKET_LOT_SIZE,
 MIN_NOTIONAL / NOTIONAL and PERCENT_PRICE(_BY_SIDE) *before* it is sent, so that a violation
 never costs an API call, and quantities are always rounded DOWN. MAX_NUM_ORDERS is parsed for
-information only: the bot's own ``max_open_orders`` limit is far lower than any exchange value.
-(EXCHANGE_MAX_NUM_ORDERS and iceberg/algo filters are not used because the bot never places such
-orders.) The exchange evaluates NOTIONAL/PERCENT_PRICE against its own reference price; ours is
-an approximation, hence the configurable safety buffer on minimum notionals.
+information only: with the default ``max_open_orders`` (3) it is irrelevant, but the bot counts
+only ITS OWN orders. MAX_POSITION (a cap on the account's total holding) is parsed but not checked
+locally because that needs the account balance; the exchange rejects a BUY beyond it, and
+``botux live-check`` reports it. (EXCHANGE_MAX_NUM_ORDERS and iceberg/algo filters are not used
+because the bot never places such orders.) The exchange evaluates NOTIONAL/PERCENT_PRICE against
+its own reference price; ours is an approximation, hence the configurable safety buffer on
+minimum notionals.
 """
 
 from __future__ import annotations
@@ -56,6 +59,10 @@ class SymbolRules:
     percent_down_sell: Decimal | None = None
     # MAX_NUM_ORDERS (0 = absent)
     max_num_orders: int = 0
+    # MAX_POSITION (0 = absent): cap on the account's TOTAL base-asset holding. The bot does not
+    # check it (it needs the account's balance); the exchange rejects a BUY beyond it. Parsed so
+    # that it can be reported instead of surprising the operator.
+    max_position: Decimal = ZERO
 
     # ------------------------------------------------------------------ construction
 
@@ -120,6 +127,8 @@ class SymbolRules:
             }
         if (f := filters.get("MAX_NUM_ORDERS")) is not None:
             kw["max_num_orders"] = int(f["maxNumOrders"])
+        if (f := filters.get("MAX_POSITION")) is not None:
+            kw["max_position"] = D(f["maxPosition"])
         return cls(
             symbol=entry["symbol"],
             status=entry.get("status", ""),
@@ -172,10 +181,13 @@ class SymbolRules:
         MIN_NOTIONAL because the exchange evaluates it against its own price, not ours.
         """
         problems: list[str] = []
-        if self.status != "TRADING":
-            problems.append(f"symbol status is {self.status or 'unknown'}, not TRADING")
-        if not self.spot_trading_allowed:
-            problems.append("spot trading is not allowed for this symbol")
+        if side is Side.BUY:
+            # Only ENTRIES are refused locally on the symbol's status: a protective SELL is always
+            # attempted and the exchange is the judge (a status read earlier may be out of date).
+            if self.status != "TRADING":
+                problems.append(f"symbol status is {self.status or 'unknown'}, not TRADING")
+            if not self.spot_trading_allowed:
+                problems.append("spot trading is not allowed for this symbol")
         if self.order_types and order_type.value not in self.order_types:
             problems.append(f"order type {order_type.value} not supported for {self.symbol}")
         if quantity <= 0:
