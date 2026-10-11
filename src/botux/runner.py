@@ -19,7 +19,6 @@ from botux.config import SUPPORTED_INTERVALS, Settings
 from botux.data.market import fetch_latest_closed, fetch_quote, validate_live_candles
 from botux.decimals import ZERO
 from botux.errors import (
-    BotuxError,
     ConfigError,
     DataError,
     ExchangeError,
@@ -34,7 +33,7 @@ from botux.execution.paper import PaperBroker
 from botux.execution.positions import PositionBook
 from botux.killswitch import KillSwitch
 from botux.ledger import Ledger, LedgerView, balance_discrepancy, owned_base
-from botux.models import Balance, Candle, Fill, OrderType, Quote, Side
+from botux.models import Balance, Candle, Fill, OrderStatus, OrderType, Quote, Side
 from botux.risk.manager import PortfolioView, RiskManager
 from botux.storage import OrderRecord, Store
 from botux.strategy.base import Signal, Strategy
@@ -45,6 +44,7 @@ DAY_MS = 86_400_000
 ACK_KEY = "ack:balances"  # set by `botux ack-balances`, consumed by the loop
 ACK_DAILY_KEY = "ack:daily_loss"  # set by `botux reset-daily-loss`, consumed by the loop
 BLOCKERS_KEY = "entry_blockers"  # JSON, for `botux status`
+REBASE_KEY = "risk:rebase"  # a capital change whose day reference is not yet rebased
 QUOTE_TOLERANCE = Decimal("0.01")
 
 
@@ -154,6 +154,13 @@ class TradingLoop:
                 "capital_changed",
                 {"from": str(self._ledger.capital_changed_from), "to": str(capital)},
             )
+            # Remembered on disk until applied: a crash before the first equity update must not
+            # restore the old day reference (a false daily-loss halt). An acknowledged cash
+            # deficit belonged to the old capital: counting it again would double-count it
+            # (any real shortfall is detected afresh and needs a new acknowledgement).
+            store.kv_set(REBASE_KEY, "1")
+            self._ledger.set_offset(settings.risk.quote_asset, ZERO)
+        if store.kv_get(REBASE_KEY):
             risk.rebase_day_start()
 
     @property
@@ -242,7 +249,23 @@ class TradingLoop:
             if not held:
                 return "unknown (balances could not be read)"
         held = {s: q for s, q in held.items() if q > 0}
-        return ", ".join(f"{s}={q}" for s, q in held.items()) or "none"
+        text = ", ".join(f"{s}={q}" for s, q in held.items()) or "none"
+        # The bot's own records may show a position it cannot sell (it cannot prove the coins are
+        # its own, or they sit in someone's order): never let an alert say "none" then.
+        try:
+            led = self._ledger.view()
+            recorded = {
+                s: led.base_qty(s)
+                for s in self._s.market.symbols
+                if led.base_qty(s) > held.get(s, ZERO)
+            }
+        except Exception:
+            recorded = {}
+        if recorded:
+            text += "; recorded by the bot but NOT sellable by it now (check the exchange): " + (
+                ", ".join(f"{s}={q}" for s, q in recorded.items())
+            )
+        return text
 
     # ------------------------------------------------------------------ one cycle
 
@@ -289,7 +312,9 @@ class TradingLoop:
             return
         try:
             self._gate_check()
-        except LiveTradingNotAllowed as exc:
+        except Exception as exc:  # an unexpected failure of the check closes the gate, too
+            if not isinstance(exc, LiveTradingNotAllowed):
+                exc = LiveTradingNotAllowed(f"gate check failed ({type(exc).__name__}: {exc})")
             self._gate_closed = True
             # a blocker, NOT a persisted halt: after the operator re-arms and restarts, the gate
             # is evaluated afresh instead of an old verdict being restored from the database
@@ -356,29 +381,36 @@ class TradingLoop:
 
     def _flatten_with_retries(self, symbol: str) -> None:
         """Try to sell the position at the emergency stop. If reading balances or the quote keeps
-        failing, SAY so: the stop must never end with the operator believing the account is flat."""
+        failing, or the order provably never reached the venue (network, rate limit, clock skew:
+        outcome ``retry_later``, safe to send again), try again; then SAY so: the stop must never
+        end with the operator believing the account is flat."""
+        failure = ""
         for attempt in range(1, self.FLATTEN_ATTEMPTS + 1):
             try:
-                self._flatten(symbol, "flatten_on_kill")
-                return
+                outcome, reason = self._flatten(symbol, "flatten_on_kill")
             except Exception as exc:
                 log.exception("flatten of %s failed (attempt %d)", symbol, attempt)
-                if attempt == self.FLATTEN_ATTEMPTS:
-                    self._notifier.notify(
-                        "CRITICAL",
-                        "Flatten failed",
-                        f"{symbol}: could not sell the position at the emergency stop "
-                        f"({type(exc).__name__}). It may still be OPEN and nothing manages it: "
-                        "close it by hand.",
-                    )
-                else:
-                    self._clock.sleep(2.0)
+                failure = f"{type(exc).__name__}"
+            else:
+                if outcome in ("accepted", "none"):
+                    return
+                failure = f"{outcome} {reason}"
+                if outcome != "retry_later":
+                    break  # sent or refused: never send a second flatten order blindly
+            if attempt < self.FLATTEN_ATTEMPTS:
+                self._clock.sleep(2.0)
+        self._notifier.notify(
+            "CRITICAL",
+            "Flatten failed",
+            f"{symbol}: could not sell the position at the emergency stop ({failure}). It may "
+            "still be OPEN and nothing manages it: close it by hand.",
+        )
 
-    def _flatten(self, symbol: str, why: str) -> None:
+    def _flatten(self, symbol: str, why: str) -> tuple[str, str]:
         rules = self._rules[symbol]
         qty = rules.round_qty(self._position_qty(symbol, self._broker.balances()), OrderType.MARKET)
         if qty <= 0:
-            return
+            return "none", ""
         quote = self._feed.quote(symbol)
         result = self._om.submit(
             OrderIntent(
@@ -392,12 +424,7 @@ class TradingLoop:
                 flatten=True,
             )
         )
-        if result.outcome != "accepted":
-            self._notifier.notify(
-                "CRITICAL",
-                "Flatten failed",
-                f"{symbol}: {result.outcome} {result.reason}. Close the position manually.",
-            )
+        return result.outcome, result.reason
 
     # ------------------------------------------------------------------ helpers
 
@@ -482,10 +509,17 @@ class TradingLoop:
             ledger_qty = led.base_qty(sym)
             disc = balance_discrepancy(total, baseline, ledger_qty, offset)
             if ack and settled and disc != 0:
-                # A human has looked: whatever lies beyond the bot's own records is the user's
-                # (baseline); if the account holds LESS than the records say, the bot owns less.
-                new_baseline = max(ZERO, total - ledger_qty)
-                new_offset = min(ZERO, total - ledger_qty)
+                # A human has looked. Incremental, never from scratch: an earlier acknowledged
+                # deficit (the offset) stays, or a later deposit of the user's would be taken for
+                # the bot's own coins. A surplus is the user's (baseline); a deficit first eats
+                # into that baseline, and what remains means the bot owns less than it recorded.
+                new_baseline, new_offset = baseline, offset
+                if disc > 0:
+                    new_baseline = baseline + disc
+                else:
+                    from_baseline = min(baseline, -disc)
+                    new_baseline = baseline - from_baseline
+                    new_offset = offset - (-disc - from_baseline)
                 self._store.kv_set(f"baseline:{base}", str(new_baseline))
                 self._baseline[base] = new_baseline
                 self._ledger.set_offset(base, new_offset)
@@ -590,9 +624,16 @@ class TradingLoop:
         for sym in self._s.market.symbols:
             owned_total, sellable = self._owned(sym, balances, led)
             qty[sym] = sellable
-            notional[sym] = owned_total * self._mid(sym, quotes, needed=owned_total > 0)
+            notional[sym] = owned_total * self._mid(sym, quotes, fallback=led.average_cost.get(sym))
             equity += notional[sym]
         self._last_positions = dict(qty)
+        # A BUY whose outcome is unknown may already have spent money without a fill on record:
+        # count its notional as exposure (not as equity), or the next symbol is sized as if it
+        # did not exist.
+        for rec in self._om.uncertain_orders():
+            if rec.side is Side.BUY:
+                px = rec.price or self._last_mid.get(rec.symbol) or led.average_cost.get(rec.symbol)
+                notional[rec.symbol] = notional.get(rec.symbol, ZERO) + rec.quantity * (px or ZERO)
         day_start = (self._now() // DAY_MS) * DAY_MS
         open_orders = len(self._om.open_orders()) + len(self._om.uncertain_orders())
         view = PortfolioView(
@@ -606,19 +647,18 @@ class TradingLoop:
         self._persist_blockers()
         return equity, view
 
-    def _mid(self, sym: str, quotes: Mapping[str, Quote], *, needed: bool) -> Decimal:
-        """Mid price of ``sym``: this cycle's quote, else the last one seen (a symbol whose quote
-        failed is still valued so the other symbols' sizing is not distorted)."""
+    def _mid(self, sym: str, quotes: Mapping[str, Quote], *, fallback: Decimal | None) -> Decimal:
+        """Mid price of ``sym``: this cycle's quote, else the last one seen, else (first cycle
+        after a restart) what the bot paid for it. Never raises: a symbol whose quote is down must
+        not stop the stop-loss of the others; its failure is counted and reported by the cycle."""
         quote = quotes.get(sym)
         if quote is not None:
             self._last_mid[sym] = quote.mid
             return quote.mid
         known = self._last_mid.get(sym)
-        if known is None:
-            if needed:
-                raise DataError(f"no price known for {sym}, which holds a position")
-            return ZERO
-        return known
+        if known is not None:
+            return known
+        return fallback if fallback is not None else ZERO
 
     def _persist_blockers(self) -> None:
         raw = json.dumps(self._risk.blockers, sort_keys=True)
@@ -642,7 +682,7 @@ class TradingLoop:
         refresh = self._s.market.rules_refresh_hours * 3600
         try:
             new = dict(self._rules_loader())
-        except BotuxError as exc:
+        except Exception as exc:  # a malformed answer must not cost the cycle (and the stop-loss)
             self._rules_next_try = now + self.RULES_RETRY_SECONDS
             log.warning("could not refresh exchange rules: %s: %s", type(exc).__name__, exc)
             if now - self._rules_loaded_at > 2 * refresh:
@@ -716,6 +756,15 @@ class TradingLoop:
         equity, view = self._snapshot(quotes)
         self._risk.update_equity(now, equity)
         self._apply_daily_loss_reset(equity)
+        if equity <= 0:
+            self._alert_throttled(
+                "equity",
+                "CRITICAL",
+                "Bot equity is not positive",
+                f"The bot sees {equity:f} {self._s.risk.quote_asset} of its own: it will not size "
+                "any order. Check risk.bot_capital and the acknowledged balance differences "
+                "('botux status'); nothing is traded meanwhile.",
+            )
         day = now // DAY_MS
         if self._risk.daily_loss_halted and self._halt_alerted_day != day:
             self._halt_alerted_day = day
@@ -746,6 +795,8 @@ class TradingLoop:
         # Bookkeeping comes AFTER protection: a full disk must not be able to skip a stop-loss.
         try:
             self._store.kv_set("risk_state", json.dumps(self._risk.export_state()))
+            if not self._risk.rebase_pending and self._store.kv_get(REBASE_KEY):
+                self._store.kv_set(REBASE_KEY, "")  # applied and saved
             self._store.add_equity(now, equity, view.free_quote)
         except Exception as exc:
             log.error("could not persist the cycle state: %s: %s", type(exc).__name__, exc)
@@ -856,11 +907,27 @@ class TradingLoop:
             )
         if info is not None and quote.bid <= info.stop_price:
             log.warning("%s stop-loss: bid %s <= stop %s", sym, quote.bid, info.stop_price)
-            result = self._submit_exit(
-                sym, held, quote, f"stop:{sym}:{self._now() // 60_000}", view, "stop-loss"
-            )
+            result = self._submit_exit(sym, held, quote, self._stop_key(sym), view, "stop-loss")
             return result is not None
         return False
+
+    MAX_STOP_ATTEMPTS_PER_MINUTE = 3
+
+    def _stop_key(self, sym: str) -> str:
+        """One stop order per attempt: while one is open or unresolved the same key keeps
+        answering "duplicate", but a stop that ended without selling (expired, refused,
+        cancelled) is tried again at the next look instead of waiting for the next minute."""
+        prefix = f"stop:{sym}:{self._now() // 60_000}"
+        failed = sum(
+            1
+            for rec in self._store.list_orders(
+                (OrderStatus.EXPIRED, OrderStatus.CANCELED, OrderStatus.REJECTED), sym
+            )
+            if rec.intent_key == prefix or rec.intent_key.startswith(prefix + ":")
+        )
+        return (
+            prefix if failed == 0 else f"{prefix}:{min(failed, self.MAX_STOP_ATTEMPTS_PER_MINUTE)}"
+        )
 
     def _signals(self, sym: str, candles: list[Candle], quote: Quote, view: PortfolioView) -> bool:
         """Act on a newly closed candle. Returns True when an order was attempted."""
@@ -869,16 +936,17 @@ class TradingLoop:
         last = candles[-1]
         key = f"lastc:{sym}"
         seen = self._store.kv_get(key)
-        if sym not in self._warmed and not self._act_current:
+        warming = sym not in self._warmed and not self._act_current
+        self._warmed.add(sym)
+        if warming and not in_position:
             # Every process start begins with a warm-up: the newest closed candle is noted and
             # not traded, however long ago the previous run stopped, so a restart can never act
-            # on a stale signal.
-            self._warmed.add(sym)
+            # on a stale ENTRY. (A held position is different: an exit is state-based, never
+            # stale, and waiting a whole candle for it would only prolong the exposure.)
             if seen in (None, "") or last.open_time_ms > int(seen):
                 self._store.kv_set(key, str(last.open_time_ms))
                 log.info("%s: warm start, waiting for the next candle before trading", sym)
             return False
-        self._warmed.add(sym)
         previous = int(seen) if seen not in (None, "") else None
         if previous is not None and last.open_time_ms <= previous:
             return False  # same candle again, or a stale answer from the API: never go backwards

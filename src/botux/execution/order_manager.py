@@ -174,7 +174,7 @@ class OrderManager:
 
     def resolve_lost(self, symbol: str) -> None:
         """Human decision: the operator checked the exchange and accepts the current state."""
-        self._store.kv_set(f"lost:{symbol}", "")
+        self._store.resolve_lost(symbol)
         self._store.log_event(self._clock.now_ms(), "WARNING", "resolve_lost", {"symbol": symbol})
 
     # ------------------------------------------------------------------ submit

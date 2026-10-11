@@ -220,6 +220,18 @@ class Store:
             )
         return cur.rowcount == 1
 
+    def resolve_lost(self, symbol: str) -> int:
+        """A human accepted the state of every LOST order of ``symbol``: they stop blocking
+        (and can never be mistaken for a LOST order of a later incident). Returns how many."""
+        with self.transaction():
+            with self._write():
+                cur = self._conn.execute(
+                    "UPDATE orders SET status=? WHERE symbol=? AND status=?",
+                    (OrderStatus.LOST_RESOLVED.value, symbol, OrderStatus.LOST.value),
+                )
+            self.kv_set(f"lost:{symbol}", "")
+        return cur.rowcount
+
     def update_order(self, rec: OrderRecord) -> None:
         with self._write():
             self._conn.execute(

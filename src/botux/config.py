@@ -523,6 +523,8 @@ def load_settings(path: str | Path | None = None, env: Mapping[str, str] | None 
         raise ConfigError(f"config file not found: {cfg_path}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"invalid TOML in {cfg_path}: {exc}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"config file {cfg_path} cannot be read ({type(exc).__name__})") from exc
     return _with_absolute_paths(parse_settings(raw))
 
 

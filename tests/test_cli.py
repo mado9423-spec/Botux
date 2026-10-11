@@ -54,9 +54,22 @@ def test_invalid_config_is_a_clean_error(
     assert "error:" in capsys.readouterr().err
 
 
+def test_kill_from_a_directory_without_the_bots_files_warns_loudly(
+    cfg_path: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Paths are relative to the current directory: a stop written where no bot has ever run
+    must not look like a success that reached the running bot."""
+    assert main(["-c", cfg_path, "kill", "--reason", "x"]) == 3
+    err = capsys.readouterr().err
+    assert "DOES NOT REACH" in err and (tmp_path / "KILL").exists()
+    assert main(["-c", cfg_path, "disarm-live"]) == 3  # nothing was armed at this path
+    assert "nothing was armed" in capsys.readouterr().err
+
+
 def test_kill_status_unkill_cycle(
     cfg_path: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    Store(tmp_path / "db-paper.sqlite3").close()  # a bot has run with these paths
     assert main(["-c", cfg_path, "kill", "--reason", "test stop"]) == 0
     assert (tmp_path / "KILL").exists()
     assert main(["-c", cfg_path, "status"]) == 0
@@ -157,7 +170,9 @@ def test_status_reports_both_modes(
 
 
 def test_disarm_and_resolve_lost(cfg_path: str, tmp_path: Path) -> None:
+    (tmp_path / "armed.json").write_text("{}")
     assert main(["-c", cfg_path, "disarm-live"]) == 0
+    assert not (tmp_path / "armed.json").exists()
     s = Store(tmp_path / "db-live.sqlite3")  # every mode has its own database file
     s.kv_set("lost:BTCUSDT", "abc")
     s.close()

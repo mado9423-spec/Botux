@@ -109,6 +109,19 @@ class TestAnUnfilledExitIsNeverReportedAsDone:
         h.loop.run_cycle()
         assert sells(h)[-1].status is OrderStatus.FILLED
 
+    def test_an_unfilled_stop_loss_is_tried_again_at_the_next_look_not_a_minute_later(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        enter_long(h)
+        h.paper.fill_plan.push("0")
+        h.feed.bid, h.feed.ask = D("90.00"), D("90.01")
+        h.loop.run_cycle()
+        assert sells(h)[-1].status is OrderStatus.EXPIRED
+        h.clock.advance(30)  # one poll later, still inside the same wall-clock minute
+        h.loop.run_cycle()
+        assert len(sells(h)) == 2 and sells(h)[-1].status is OrderStatus.FILLED
+
     def test_a_half_filled_stop_loss_is_reported_and_retried(
         self, cfg: Settings, rules: SymbolRules, store: Store
     ) -> None:

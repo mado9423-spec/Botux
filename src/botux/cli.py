@@ -335,9 +335,19 @@ def cmd_kill(args: argparse.Namespace) -> int:
         )
     print(
         f"kill switch SET: {s.paths.kill_file}\n"
-        "A bot using this same file cancels open orders and stops. Make sure it was started with "
-        "the same config and from a directory that resolves to this path."
+        "A bot using this same file cancels open orders and stops."
     )
+    if not any(Path(database_path(s, m)).exists() for m in ("paper", "live")):
+        print(
+            "WARNING: no bot database exists at the paths this config resolves to "
+            f"({database_path(s, 'paper')} / {database_path(s, 'live')}). If a bot is running "
+            "from another directory or with another config, THIS STOP DOES NOT REACH IT: run "
+            "the command from the bot's own directory (relative paths in the config are resolved "
+            "against the current directory) or put absolute paths in [paths]; otherwise stop the "
+            "process itself (Ctrl+C / SIGTERM).",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 
@@ -394,7 +404,15 @@ def cmd_arm_live(args: argparse.Namespace) -> int:
 
 
 def cmd_disarm_live(args: argparse.Namespace) -> int:
-    disarm(_settings(args))
+    if not disarm(_settings(args)):
+        print(
+            "nothing was armed at the arming-file path this config resolves to (relative paths "
+            "are resolved against the current directory). A bot running from another directory "
+            "or with another config is NOT affected: stop it with 'botux kill' there, or stop "
+            "the process.",
+            file=sys.stderr,
+        )
+        return 3
     print(
         "live trading disarmed: a bot that is already running stops NEW entries on its next look "
         "but still manages exits (stop-loss / strategy exit) for positions it holds. To stop "
@@ -409,7 +427,7 @@ def cmd_resolve_lost(args: argparse.Namespace) -> int:
     if not db.exists():
         raise BotuxError(f"no {args.mode} database at {db}")
     store = Store(db)
-    store.kv_set(f"lost:{args.symbol}", "")
+    store.resolve_lost(args.symbol)
     store.log_event(SystemClock().now_ms(), "WARNING", "resolve_lost", {"symbol": args.symbol})
     store.close()
     print(f"{args.symbol}: LOST flag cleared in the {args.mode} database by operator decision.")

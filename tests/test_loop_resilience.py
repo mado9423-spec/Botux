@@ -103,6 +103,24 @@ class TestProtectionIsIsolated:
         assert h.loop.risk.consecutive_errors == 1  # the failure is still counted and logged
         assert any("cycle_error" in e["kind"] for e in store.events())
 
+    def test_after_a_restart_a_held_symbol_with_a_dead_quote_cannot_disable_anothers_stop(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        """No last price is known for the dead symbol (fresh process): it is valued at its
+        cost, and the other symbol's stop-loss still runs."""
+        h = two_symbol_harness(cfg, rules, store)
+        enter_long(h)
+        assert h.paper.balances()["BTC"].free > 0 and h.paper.balances()["ETH"].free > 0
+        assert isinstance(h.feed, FlakyFeed)
+        h.loop._last_mid.clear()  # what a restart does
+        h.feed.failing = {"ETHUSDT"}
+        h.feed.bid, h.feed.ask = D("90.00"), D("90.01")
+        h.loop.run_cycle()
+        stops = [
+            o for o in h.orders() if o.symbol == "BTCUSDT" and o.intent_key.startswith("stop:")
+        ]
+        assert stops and stops[0].status is OrderStatus.FILLED
+
     def test_a_failing_database_write_cannot_skip_the_stop_loss(
         self, cfg: Settings, rules: SymbolRules, store: Store, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -209,6 +227,18 @@ class TestNoTradingOnStaleSignals:
         assert h.orders() == []  # candle 4 was noted, not traded
         assert store.kv_get("lastc:BTCUSDT") == str(h.candles[4].open_time_ms)
 
+    def test_a_restarted_process_still_acts_on_a_strategy_exit_that_closed_while_away(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        """Only ENTRIES are held back by the warm-up: an exit is state, never stale."""
+        h = harness(cfg, rules, store)
+        enter_long(h)  # bought on candle 4
+        h.clock.advance(4 * 3600)  # the exit candle (8) has closed while the bot was away
+        h.feed.mark_to_last_close()
+        second = self.make_second_loop(h, cfg, rules, store)  # a restart: nothing warmed up
+        second.run_cycle()
+        assert any(o.intent_key.endswith(":SELL") for o in h.orders())
+
     def test_a_late_cycle_in_the_same_process_skips_an_old_entry_but_not_an_old_exit(
         self, cfg: Settings, rules: SymbolRules, store: Store
     ) -> None:
@@ -251,3 +281,38 @@ class TestCadence:
 def test_json_state_is_plain(store: Store) -> None:
     store.kv_set("x", json.dumps({"a": 1}))
     assert json.loads(store.kv_get("x") or "{}") == {"a": 1}
+
+
+class TestUnresolvedBuysCountAsExposure:
+    def test_an_unknown_buy_is_part_of_the_exposure_of_the_next_symbol(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        from botux.models import OrderType
+        from botux.storage import OrderRecord
+
+        h = two_symbol_harness(cfg, rules, store)
+        h.cycle()
+        store.insert_order(
+            OrderRecord(
+                "bx" + "a" * 30, "k", "BTCUSDT", Side.BUY, OrderType.MARKET, D("0.5"), None,
+                OrderStatus.UNKNOWN, h.clock.now_ms(), h.clock.now_ms(),
+            )
+        )  # fmt: skip
+        _, view = h.loop._snapshot({"BTCUSDT": h.feed.quote("BTCUSDT")})
+        assert view.positions_notional["BTCUSDT"] >= D("0.5") * D("99")
+        assert view.equity < D("1100")  # counted as exposure, NOT as equity
+
+
+class TestCapitalChangeSurvivesACrash:
+    def test_the_rebase_request_is_remembered_until_a_cycle_has_applied_it(
+        self, cfg: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        h = harness(cfg, rules, store)
+        h.cycle()  # the day reference exists and is saved
+        smaller = dataclasses.replace(cfg, risk=dataclasses.replace(cfg.risk, bot_capital=D(400)))
+        second = TestNoTradingOnStaleSignals().make_second_loop(h, smaller, rules, store)
+        assert store.kv_get("risk:rebase") == "1"  # written the moment the change is seen
+        third = TestNoTradingOnStaleSignals().make_second_loop(h, smaller, rules, store)
+        assert third.risk.rebase_pending  # a crash before the first cycle forgot nothing
+        second.run_cycle()
+        assert not store.kv_get("risk:rebase")  # applied and saved

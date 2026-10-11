@@ -82,8 +82,12 @@ def write_arm_file(settings: Settings, now_ms: int) -> Path:
     return path
 
 
-def disarm(settings: Settings) -> None:
-    _arm_path(settings).unlink(missing_ok=True)
+def disarm(settings: Settings) -> bool:
+    """Remove the arming file; True if there was one (False: nothing was armed HERE)."""
+    path = _arm_path(settings)
+    existed = path.exists()
+    path.unlink(missing_ok=True)
+    return existed
 
 
 def arm_live_interactive(

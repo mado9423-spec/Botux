@@ -197,3 +197,20 @@ class TestCommand:
         # with the flag but a paper config it still refuses before reading any key or connecting
         assert main(["-c", cfg_path, "live-check", "--confirm-contact-binance"]) == 2
         assert "mode" in capsys.readouterr().err
+
+
+class TestTheRehearsalClientCannotTrade:
+    def test_the_client_is_built_without_the_right_to_place_or_cancel_orders(
+        self, settings: Settings, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: dict[str, object] = {}
+
+        class Spy(BinanceSpotClient):
+            def __init__(self, **kw: object) -> None:
+                seen.update(kw)
+                super().__init__(**kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("botux.execution.livecheck.BinanceSpotClient", Spy)
+        code, _ = run(live(settings), rehearsal_exchange(clock), clock)
+        assert code == 0
+        assert seen["trading_enabled"] is False and seen["order_test_enabled"] is True

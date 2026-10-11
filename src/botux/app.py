@@ -12,7 +12,7 @@ import httpx
 from botux.alerts import CompositeNotifier, FileNotifier, LogNotifier
 from botux.clock import Clock, SystemClock
 from botux.config import Settings, database_path, settings_fingerprint
-from botux.errors import BotuxError, ConfigError, ExchangeError, LiveTradingNotAllowed
+from botux.errors import ConfigError, ExchangeError, LiveTradingNotAllowed
 from botux.exchange.client import BinanceSpotClient
 from botux.exchange.rules import SymbolRules
 from botux.execution.broker import Broker
@@ -36,6 +36,7 @@ _PAPER_SESSION_PREFIXES = (
     "baseline:",
     "lost:",
     "risk_state",
+    "risk:",
     "ledger:",
     "ack:",
     "entry_blockers",
@@ -233,8 +234,10 @@ def make_gate_check(
         if reload_settings is not None:
             try:
                 on_disk = reload_settings()
-            except BotuxError as exc:
-                raise LiveTradingNotAllowed(f"settings file unreadable or invalid: {exc}") from None
+            except Exception as exc:  # any failure to re-read the file closes the gate
+                raise LiveTradingNotAllowed(
+                    f"settings file unreadable or invalid: {type(exc).__name__}: {exc}"
+                ) from None
             if settings_fingerprint(on_disk) != running:
                 raise LiveTradingNotAllowed(
                     "settings changed on disk since this process started; restart (and re-arm) "

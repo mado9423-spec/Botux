@@ -27,6 +27,7 @@ class OrderStatus(StrEnum):
     * PENDING_SEND: persisted before sending; we do not know whether it left the machine.
     * UNKNOWN: sent, but the answer was a timeout/5XX/-1007. It may have been executed.
     * LOST: reconciliation found no such order after repeated checks. Terminal. Never auto-resent.
+    * LOST_RESOLVED: a LOST order a human has looked at and accepted (``botux resolve-lost``).
     """
 
     PENDING_SEND = "PENDING_SEND"
@@ -38,6 +39,7 @@ class OrderStatus(StrEnum):
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
     LOST = "LOST"
+    LOST_RESOLVED = "LOST_RESOLVED"
 
     @property
     def is_terminal(self) -> bool:
@@ -55,6 +57,7 @@ TERMINAL_STATUSES = frozenset(
         OrderStatus.REJECTED,
         OrderStatus.EXPIRED,
         OrderStatus.LOST,
+        OrderStatus.LOST_RESOLVED,
     }
 )
 

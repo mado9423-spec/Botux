@@ -108,6 +108,10 @@ class RiskManager:
         """Lift one blocker. Returns True when it was set."""
         return self._blockers.pop(key, None) is not None
 
+    @property
+    def rebase_pending(self) -> bool:
+        return self._rebase_pending
+
     def rebase_day_start(self) -> None:
         """Use the next equity reading as today's reference (e.g. after the bot capital changed).
 

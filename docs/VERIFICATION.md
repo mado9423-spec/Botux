@@ -10,10 +10,10 @@ Python 3.13.16 · uv 0.11.32 · ruff 0.17.0 · mypy 2.4.0 (strict) · pytest 9.1
 
 | الأمر | النتيجة |
 |---|---|
-| `make check` (= `ruff check` + `ruff format --check` + `mypy` + `pytest`) | **exit 0** — `All checks passed!` · `73 files already formatted` · `Success: no issues found in 62 source files` · **580 passed** |
-| `uv run pytest -q --cov=botux --cov-report=term` | 580 passed · التغطية **95%** (4017 سطراً، 208 غير مغطى؛ أدناها `cli.py` 82%) |
+| `make check` (= `ruff check` + `ruff format --check` + `mypy` + `pytest`) | **exit 0** — `All checks passed!` · `73 files already formatted` · `Success: no issues found in 62 source files` · **595 passed** |
+| `uv run pytest -q --cov=botux --cov-report=term` | 595 passed · التغطية **95%** (4071 سطراً، 210 غير مغطى؛ أدناها `cli.py` 82%) |
 | `uv export --no-hashes --no-emit-project > req.txt && uvx pip-audit -r req.txt --no-deps --disable-pip` | `No known vulnerabilities found` (20 اعتمادية مثبّتة) |
-| فحص أسرار على الملفات المتتبَّعة (79 ملفاً؛ يُستثنى `uv.lock` لأنه تجزئات) | لا أسرار؛ أربع مطابقات «سلسلة طويلة» هي **أسماء أصناف** في الاختبارات (لا قيم). لا `.env` متتبَّع غير `.env.example` (قيم وهمية). لا اسم ملف أسرار في التاريخ سوى `secrets_guard.py` و`test_secrets.py` |
+| فحص أسرار على الملفات المتتبَّعة (80 ملفاً؛ يُستثنى `uv.lock` لأنه تجزئات) | لا أسرار؛ أربع مطابقات «سلسلة طويلة» هي **أسماء أصناف** في الاختبارات (لا قيم). لا `.env` متتبَّع غير `.env.example` (قيم وهمية). لا اسم ملف أسرار في التاريخ سوى `secrets_guard.py` و`test_secrets.py` |
 | فحص المضيفات في `src/` | `api.binance.com`، `data-api.binance.vision`، `github.com` (توثيق) فقط؛ لا مضيف غير موثّق |
 | إعدادات Claude Code/MCP/مهارات داخل المشروع | لا `.claude/` ولا `CLAUDE.md` ولا `.mcp.json`؛ **لم أُثبّت أي مهارة أو إضافة أو مستودع خارجي** |
 
@@ -44,6 +44,30 @@ Python 3.13.16 · uv 0.11.32 · ruff 0.17.0 · mypy 2.4.0 (strict) · pytest 9.1
 - أهم ما كُشف وأُصلح: الحجم/الخسارة اليومية كانت على رصيد الحساب كله؛ عملة المستخدم قد تُباع أو يختفي مركز البوت عند أي إيداع/سحب؛ لا كشف للأوامر الغريبة؛
   خروج غير منفَّذ بلا تنبيه؛ بيع ضائع لا يحجب بيعاً ثانياً؛ كتابة غير ذرّية للتنفيذات؛ halt البوابة المخزَّن لا يزول؛ `kill` يعلن نجاحاً دون كتابة؛ خلط بيئات testnet/mainnet؛
   شمعة ناقصة واحدة تُطلق الإيقاف الطارئ؛ سقوف الأمر تُقاس عند الـask لا عند أسوأ تنفيذ؛ تداول على إشارة قديمة بعد إعادة التشغيل؛ `DELETE /openOrders` (يلغي أوامرك) متاح في القائمة.
+
+## المراجعة المستقلة الثانية (على لقطة الشيفرة الجديدة: الدفتر والملكية والحلقة والبوابة)
+
+أربع عدسات قراءة فقط؛ **ثلاث ملاحظات تأكّدت** بمتحقق مستقل (أُعيد إنتاجها)، و**28 ملاحظة لم يكتمل تحققها** (فشل وكلاء التحقق بـ«حد الجلسة») فتحقّقتُ منها **بنفسي**
+بقراءة الشيفرة. لكل ما ثبت كتبتُ اختباراً **يفشل على الشيفرة القديمة** (جرّبتُ ذلك بإرجاع `src/` مؤقتاً) ويمرّ على الجديدة:
+
+| ما ثبت وأُصلح | الاختبار |
+|---|---|
+| إقرار `ack-balances` ثانٍ يمحو العجز المُقَرّ سابقاً فيُباع إيداع المستخدم (D31) | `test_second_review.py::test_a_second_ack_keeps_the_first_acknowledged_deficit` |
+| أول دورة بعد إعادة تشغيل مع تعطّل سعر رمز محتفَظ به تُسقط وقف الخسارة لكل الرموز | `test_loop_resilience.py::…dead_quote_cannot_disable_anothers_stop` |
+| فشل إعادة قراءة الإعداد (ترميز/صلاحيات) أو أي استثناء من فحص الحاجز يتخطى الوقف ثم يُطلق الإيقاف الذاتي (D35) | `test_second_review.py` (حاجز + `load_settings`) |
+| فشل تحديث `exchangeInfo` بشكل غير متوقع يُسقط الدورة قبل الوقف | `test_rules_refresh_with_a_malformed_answer…` |
+| `kill`/`disarm-live` من مجلد خاطئ تطبع نجاحاً دون أن تصل للبوت | `test_cli.py::…without_the_bots_files_warns_loudly` |
+| أمر `LOST` محسوم يعود فيحجب الخروج عند أول `LOST` لاحق (D32) | `…resolved_lost_orders_do_not_come_back…` |
+| التفريغ الطارئ لا يُعيد المحاولة حين لم يغادر الأمر الجهاز | `…flatten_retries_when_the_order_provably_did_not_leave` |
+| أمر شراء مجهول النتيجة لا يُحتسب في تعرّض الرمز التالي | `test_loop_resilience.py::TestUnresolvedBuysCountAsExposure` |
+| التسخين يبتلع خروجاً معلّقاً بعد إعادة التشغيل (D34) | `…still_acts_on_a_strategy_exit_that_closed_while_away` |
+| وقف انتهى دون بيع لا يُعاد قبل الدقيقة التالية (D33) | `test_review_fixes.py::…tried_again_at_the_next_look…` |
+| طلب إعادة ضبط مرجع اليوم بعد تغيير رأس المال لا يبقى بعد انهيار مبكر؛ العجز المُقَرّ القديم لا يُحتسب مرتين؛ تنبيه عند حقوق ملكية غير موجبة | `…TestCapitalChangeSurvivesACrash` |
+| التنبيهات تقول «لا شيء» رغم مركز مسجَّل لا يستطيع البوت بيعه | `…an_alert_never_says_none…` |
+
+اختبارات سدّ فجوات (لم تكن عيوباً سلوكية): التفريغ الطارئ لا يبيع إلا ما للبوت (طفرة «بع كل الرصيد الحر» تسقط الاختبار)، وعميل `live-check` يُبنى دون حق إنشاء/إلغاء أوامر.
+**ما لم أعالجه عمداً** (فجوات اختبار تنظيمية لا أثر سلوكياً مثبتاً، أو قرارات تصميم): اختبارات لتوصيل الجذر التركيبي (قفل النسخة، مراقبة الإعداد، معالجات الإشارات)،
+واختبارات تسمية/باكتست إضافية، وأن أوامر `ack-balances` و`reset-daily-loss` و`resolve-lost` أعلام يستطيع أي سكربت تشغيلها (قرار موثَّق: هي محاسبة لا ترسل أوامر، والتسليح وحده تفاعلي).
 
 ## ما لم يُختبر وما لا يمكن ادعاؤه
 
