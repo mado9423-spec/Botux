@@ -1,8 +1,8 @@
 # Plan: an event-driven core shared by backtest and live
 
-> **Status: PROPOSAL. Nothing in this document has been implemented.** No source file, test, config or
-> dependency was changed to produce it. It is a plan for your review; every step below needs your approval
-> before any code is written.
+> **Status: APPROVED IN PART (2026-10-11).** Owner decisions are recorded in §11. Authorised now: **M0–M3
+> only** (then stop, report, wait). M4+ is not started; M8 needs separate approval. The rest of this
+> document is the original proposal and is unchanged except §9.3 (new evidence) and §11 (decisions).
 >
 > Honest scope notes. (1) Nothing here promises better trading results; the goal is *testability and
 > parity*. (2) The signed Binance connector has still never touched the real API (HTTP 451 from the build
@@ -140,19 +140,23 @@ Persistence (risk_state, equity) is subscribed with a LATER registration slot th
 class Strategy(Protocol):
     name: str
     warmup: int
+
     def on_event(self, event: Event, ctx: StrategyContext) -> Sequence[Intent]: ...
 
+
 @dataclass(frozen=True)
-class Intent:                 # strategy-level, NOT an order
+class Intent:  # strategy-level, NOT an order
     kind: Literal["ENTER_LONG", "EXIT_LONG"]
     symbol: str
-    intent_key: str           # stable: f"{strategy}:{symbol}:{candle.open_time_ms}:{side}"  (same scheme as today)
+    # stable key, same scheme as today: f"{strategy}:{symbol}:{candle.open_time_ms}:{side}"
+    intent_key: str
     reason: str
 
-class StrategyContext(Protocol):          # read-only
-    def now_ms(self) -> int: ...          # event time, from the injected Clock
-    def candles(self, symbol: str, n: int) -> Sequence[Candle]: ...    # closed candles only
-    def position(self, symbol: str) -> PositionView: ...               # owned qty, avg cost (ledger-derived)
+
+class StrategyContext(Protocol):  # read-only
+    def now_ms(self) -> int: ...  # event time, from the injected Clock
+    def candles(self, symbol: str, n: int) -> Sequence[Candle]: ...  # closed candles only
+    def position(self, symbol: str) -> PositionView: ...  # owned qty, avg cost (ledger-derived)
 ```
 
 * **No quantity, price or order type in an `Intent`.** Sizing, caps, spread, age and blockers are *downstream*
@@ -190,11 +194,12 @@ nearly everywhere; **no direct `time.time()` outside `clock.py`** (verified). Wh
 ### 5.1 Interfaces
 
 ```python
-class EventSource(Protocol):            # produces events into the bus
+class EventSource(Protocol):  # produces events into the bus
     def start(self, bus: EventBus, clock: Clock) -> None: ...
     def stop(self) -> None: ...
 
-class ExecutionVenue(Protocol):         # == today's Broker (execution/broker.py:13), unchanged
+
+class ExecutionVenue(Protocol):  # == today's Broker (execution/broker.py:13), unchanged
     place_order / get_order / cancel_order / open_orders / order_fills / balances / update_rules
 ```
 
@@ -402,7 +407,7 @@ other tests passed** for each (so those checks bind only in unit tests).
 
 | ID | Gate | Where | Relationship / evidence | My classification |
 |---|---|---|---|---|
-| G1 | `risk.bot_capital is None` refused in the live gate | `safety.py:129` | **SURVIVED.** Same requirement enforced again at `TradingLoop.__init__` (`runner.py:139`, `ConfigError`) and `check_funding` (`app.py:269`) | **Duplicate + untested** — loop refuses anyway (different exception). Needs a test or a decision |
+| G1 | `risk.bot_capital is None` refused in the live gate | `safety.py:129` | **SURVIVED in round 1; now KILLED** (round 2: `TestNoExplicitCapitalRefusesToStart`). Round-1 note: Same requirement enforced again at `TradingLoop.__init__` (`runner.py:139`, `ConfigError`) and `check_funding` (`app.py:269`) | **Duplicate + untested** — loop refuses anyway (different exception). Needs a test or a decision |
 | G2 | arming file must carry the confirmation-phrase digest | `safety.py:148` (digest written at `:76`) | **SURVIVED.** The digest is a public constant; anyone who can write the file can compute it; fingerprint + age + interactive prompt already cover accidents (SECURITY.md already calls the file a "speed bump") | **No measured protection** |
 | G3 | arming file dated in the future (> 60 s) | `safety.py:158` | KILLED (`test_future_dated_arming_is_refused`) | Marginal (clock-skew / forged file only) |
 | G4 | kill switch checked in the gate | `safety.py:127` | KILLED. Also checked at `OrderManager.submit` (`order_manager.py:184`), every `run_cycle` (`runner.py:273`), and `KillSwitch.ensure_writable` at start (`app.py:100`) | **4× overlap** — `submit` is the last line; gate-level adds only start-up refusal |
@@ -419,6 +424,23 @@ other tests passed** for each (so those checks bind only in unit tests).
 | G15 | `check_funding` (start-only refusal) vs ownership cash-deficit blocker | `app.py:269` vs `runner.py:488` | analysis only | Partial overlap; start-up vs runtime |
 | G16 | `--confirm-checked` / `--confirm-contact-binance` | `cli.py` (`ack-balances`, `reset-daily-loss`, `live-check`) | analysis only | Prevent typos, not scripts (documented); no technical protection against a script |
 
+**Round 2 evidence (decision 5; nothing removed).** After adding the G1 tests (the gate layer *and* the loop layer at `runner.py:139`, which had no test at all, are now each killed by their own test), I mutated more gates in a scratch copy and ran the whole suite:
+
+| Gate | Result | Reading |
+|---|---|---|
+| `[live].enabled` (`safety.py:125`) | KILLED (2 tests, `test_live_gate.py`) | pinned; overlap with G10 is by design |
+| `mode == "live"` (`safety.py:123`) | KILLED (2 tests) | pinned |
+| stale-data check in `validate_live_candles` | KILLED (2 tests: `test_backtest.py`, `test_runner.py`) | pinned (so G13 is *not* dead code, only dominated for entries) |
+| entry signal-age guard (`runner.py:960`) | KILLED (1 test) | pinned |
+| `check_funding` at live start (`app.py:269`) | KILLED (1 test, `test_review_fixes.py`) | pinned (G15 overlap is partial) |
+| `OrderManager.submit` kill check (`order_manager.py:184`) | KILLED (2 tests) | pinned — the last line of the 4× kill-switch overlap (G4) |
+| `kill.ensure_writable()` at start (`app.py:100`) | **SURVIVED — no test notices** | untested; the CLI `kill` command's write-failure path *is* tested, the start-up refusal is not. Candidate for a test, not for removal |
+| `claim_mode("paper")` (`app.py:171`) | KILLED (1 test) | pinned |
+| `max_spread_pct` entry guard | KILLED (1 test) | pinned |
+| `max_orders_per_day` | KILLED (1 test, `test_risk.py` only) | unit-pinned only, like G11/G12 |
+
+Conclusions for your review: the only gate that is *both* unpinned *and* duplicated was G1 (now pinned); G2 (arming-phrase digest) remains the one with no measured protection; `ensure_writable` at start-up is unpinned but not duplicated; G11/G12 and `max_orders_per_day` bind only in unit tests.
+
 Not duplicates (listed so you can see what I would **keep**): the endpoint allow-list; live-gate fingerprint-vs-disk comparison; API-key
 restriction check (start + hourly); ownership ledger/blockers; write-ahead + deterministic ids.
 
@@ -432,6 +454,16 @@ restriction check (start + hourly); ownership ledger/blockers; write-ahead + det
 4. **Exchange-side stop:** defer until after M7 and until a Testnet-capable environment exists (§9.1)? And `STOP_LOSS` vs `STOP_LOSS_LIMIT` preference.
 5. **Gate list (§9.3):** which entries, if any, you want turned into a *test* (G1 is the clearest), investigated further, or consolidated. I changed nothing.
 6. Fixtures: OK to commit fixtures derived from *paper/simulated* sessions only?
+
+## 11. Owner decisions (recorded 2026-10-11)
+
+1. **Approved:** M0–M3 only; stop after M3, report, wait. M4 not started. M8 needs separate approval.
+2. **Approved:** P0 strategy-intent parity is the definition of "same results". Fills, slippage, fees and latency are metrics only, never compared.
+3. **Confirmed:** no `nautilus_trader` or any new dependency.
+4. **Approved:** exchange-side stop deferred until after M7 and a Testnet-capable environment; a second layer, never a replacement for the software stop.
+5. **G1:** first a test proving the start-up refusal works (done: `tests/test_live_gate.py::TestNoExplicitCapitalRefusesToStart`, 3 tests; both the gate layer and the loop layer are now pinned — see §9.3). **No check is removed in this round.** Other duplicates: investigated further (§9.3, "Round 2 evidence"), nothing removed.
+6. **Approved:** fixtures only from paper/simulated sessions. **Before any commit, every fixture is scanned for API keys, account IDs, balances and IP addresses; if anything is found: stop and report.** (Implemented from M0 as `tests/test_fixture_hygiene.py`, which fails on any such pattern in a fixture directory, so the scan is also part of `make check`.)
+7. **Priority:** the strategy's out-of-sample backtest with realistic fees and slippage comes before further architecture work — see `docs/BACKTEST_OUT_OF_SAMPLE.md`.
 
 ## Appendix A — experiment log (reproducible; all in a scratch copy, no network)
 

@@ -581,3 +581,48 @@ class TestLiveBroker:
             }
         )
         assert got.avg_price == D(60000) and got.fills[0].commission_asset == "BTC"
+
+
+class TestNoExplicitCapitalRefusesToStart:
+    """``risk.bot_capital`` is demanded at start-up by two independent layers (the gate, then the
+    trading loop). Each is proven to work ALONE, so neither has to be trusted to cover the other."""
+
+    @staticmethod
+    def no_capital(settings: Settings) -> Settings:
+        s = live(settings)
+        return dataclasses.replace(s, risk=dataclasses.replace(s.risk, bot_capital=None))
+
+    def test_the_gate_refuses_naming_the_capital_with_everything_else_in_order(
+        self, settings: Settings, clock: FakeClock
+    ) -> None:
+        s = self.no_capital(settings)
+        arm(s, clock)  # mode live, enabled, armed for exactly these settings, kill switch clear
+        with pytest.raises(LiveTradingNotAllowed, match="bot_capital is not set"):
+            check_live_gate(s, kill_for(s, clock), clock.now_ms())
+
+    def test_building_the_live_broker_refuses_before_any_key_is_read_or_request_sent(
+        self, settings: Settings, clock: FakeClock, store: Store, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def explode(*_a: object, **_k: object) -> None:
+            raise AssertionError("credentials were read although the capital is missing")
+
+        monkeypatch.setattr("botux.execution.live.load_credentials", explode)
+        s = self.no_capital(settings)
+        arm(s, clock)
+        ex = live_exchange(clock)
+        with pytest.raises(LiveTradingNotAllowed, match="bot_capital is not set"):
+            build_live_app(s, ENV, http=ex.http(), clock=clock, store=store)
+        assert ex.requests == []
+
+    def test_the_trading_loop_refuses_on_its_own_even_if_the_gate_were_bypassed(
+        self, settings: Settings, rules: SymbolRules, store: Store
+    ) -> None:
+        from botux.errors import ConfigError
+        from tests.test_loop_resilience import TestNoTradingOnStaleSignals
+        from tests.test_runner import harness
+
+        h = harness(settings, rules, store)
+        with pytest.raises(ConfigError, match="bot_capital must be set"):
+            TestNoTradingOnStaleSignals().make_second_loop(
+                h, self.no_capital(settings), rules, store
+            )
